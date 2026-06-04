@@ -1,0 +1,1 @@
+# n_sqaured_clique
