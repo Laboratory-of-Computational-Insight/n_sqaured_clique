@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project
+.venv/
+datasets
+datasets/
+runs/
+!libpmc.so
+!pmc/libpmc.so
