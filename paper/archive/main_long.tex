@@ -1,0 +1,1344 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+
+\usepackage{amsmath,amssymb}
+\usepackage{amsthm}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{adjustbox}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{natbib}
+\usepackage{pifont}
+\newcommand{\cmark}{\ding{51}}
+\newcommand{\xmark}{\ding{55}}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{1\baselineskip}
+
+\title{Untitled}
+\author{Author Name}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% ============================================================
+\begin{abstract}
+  Residual decoding algorithms score elements, prune one, and update state iteratively.
+  Classical algorithms exploit additive statistics such as degree to perform each update
+  in $O(n)$, achieving $O(n^2)$ total cost. We show that this efficiency is
+  algebraically unavailable to GNNs: exact additive updates require affine score
+  encodings, which bounded nonlinear activations cannot implement, and vanishing score
+  margins cause approximation errors to invert removal orderings at scale, cascading
+  into trajectory divergence. This forces a full network rerun after every deletion,
+  inflating cost to $O(n^3)$.
+
+  We show that the objective gradient provides an exact local correction after each
+  vertex deletion, maintainable in $O(n)$ per step. Supplying this live gradient signal
+  to a lightweight learned updater $U_\theta$ exposes an additive signal whose first
+  linear layer can represent the exact residual correction before any nonlinearity fires,
+  recovering $O(n^2)$ decoding.
+
+  We validate on \textsc{Max-Clique} using planted-clique instances and a decoder
+  ablation spanning the full $O(n^3)$-to-$O(n^2)$ spectrum. Cached-gradient variants
+  match or exceed the $O(n^3)$ rerun baseline across all difficulty regimes.
+\end{abstract}
+
+% ============================================================
+\section{Introduction}
+% ============================================================
+
+A wide class of combinatorial algorithms proceeds by a \emph{residual loop}: score
+the current elements, prune or select one, update the problem state, and repeat.
+This loop underlies greedy peeling~\citep{feige2010}, spectral
+rounding~\citep{alon1998}, branch-and-bound solvers, and local greedy methods more
+broadly. Its tractability
+rests on the \emph{additivity} of the maintained statistics. Degree is the
+simplest example: when a vertex is removed, each survivor's degree changes by at
+most one, depending only on local adjacency. This local, fixed correction makes the
+full update $O(n)$, giving $O(n^2)$ total decoding on dense graphs.
+
+\paragraph{Problem setting.}
+We focus on \textsc{Max-Clique}: given a graph, find the largest subset of vertices
+that are all pairwise adjacent. The decision version is NP-complete and the
+optimization problem is NP-hard, making clique recovery a notorious testbed for
+algorithmic heuristics. Classical decoders attack it with greedy top-$k$ selection,
+local-degree refinement, spectral rounding, and related residual scoring rules. In
+the planted-clique setting used in our experiments, the clique is hidden inside a
+random background graph and the decoder must recover it. This makes
+\textsc{Max-Clique} a natural place to ask whether learned scorers can replace these
+hand-designed residual heuristics without losing their efficient update structure.
+
+\paragraph{GNNs as learned scorers.}
+GNNs have emerged as the natural candidate for replacing hand-crafted statistics
+with learned scoring rules~\citep{karalias2020, min2022, garmendia2024}. Trained
+end-to-end on problem instances, they produce vertex rankings for \textsc{Max-Clique},
+\textsc{Max-Cut}, \textsc{Max-Independent-Set}, and related problems without
+domain-specific feature engineering. Recent interpretability work shows that GNNs
+trained on combinatorial tasks tend to rediscover classical algorithmic
+heuristics~\citep{cappart2023}, and for \textsc{Max-Clique} specifically, degree-based
+vertex ranking emerges consistently across architectures and training
+regimes~\citep{shoham2026ltr}. This raises an optimistic picture: a GNN that has
+internalized degree-based scoring should, in principle, slot directly into the
+residual loop in place of the classical scorer.
+
+\paragraph{The efficiency gap.}
+This hope runs into a precise algebraic obstruction. A score encoding $\varphi$
+supports an exact additive update $\varphi(d-1) = \varphi(d) - c$ if and only if
+$\varphi$ is affine (Theorem~\ref{thm:affine}). Any nonlinear activation is
+incompatible: a bounded function cannot implement an unbounded affine map
+(Theorem~\ref{thm:nonlinear}). The problem compounds with scale: as instance size
+grows, score gaps between adjacent candidates vanish, so even a fixed approximation
+error suffices to invert the removal ordering on arbitrarily large instances
+(Theorem~\ref{thm:approx_flip}; Corollary~\ref{cor:vanishing_margin}). Once an
+inversion occurs, the approximate and exact decoders evolve on structurally different
+residual graphs, and subsequent errors grow without bound rather than averaging out
+(Theorem~\ref{thm:propagation}). The only safe remedy is to rerun the GNN after every
+deletion---$O(n^2)$ per step, $O(n^3)$ total.
+
+\paragraph{The gradient as an additive coordinate.}
+The obstruction above does not rule out efficient decoding; it rules out efficient
+decoding from the \emph{raw GNN score} alone. We show that the objective gradient
+provides exactly the additive information that is missing. For any locally
+decomposable objective, deleting vertex $v$ changes each surviving gradient
+coordinate $g_i$ by a quantity determined entirely by the local factor between $i$
+and $v$ (Lemma~\ref{lem:local_gradient_correction}). For the clique objective this
+correction is an affine function of the deleted vertex's cached probability. This
+means the gradient can be updated in $O(n)$ per deletion by maintaining three
+sufficient statistics, giving $O(n^2)$ total
+maintenance cost after the initial $O(n^2)$ GNN pass
+(Theorem~\ref{thm:cached_gradient_complexity}).
+
+Supplying this live cached gradient to a learned score updater $U_\theta$ turns the
+problem around: the exact residual correction $\Delta g_i$ is a linear function of
+$U_\theta$'s inputs when $g_i$ is available, so the first linear layer of $U_\theta$
+can represent it exactly before any nonlinearity fires
+(Theorem~\ref{thm:gu_positive}). Without the gradient, recovering $\Delta g_i$ from
+the nonlinear score $\sigma(z_{v})$ requires inverting $\sigma$---exactly the
+impossibility established in Theorem~\ref{thm:nonlinear}.
+
+\paragraph{Contributions.}
+On the theory side we prove:
+\begin{itemize}
+  \item \textbf{Theorem~\ref{thm:affine}.} Exact additive updates force affine score
+    encodings: any score that updates correctly after every deletion must be linear
+    in the maintained statistic.
+  \item \textbf{Theorem~\ref{thm:nonlinear}.} Nonlinear GNNs cannot be affine:
+    bounded activations are incompatible with the unbounded affine structure that
+    exact updates require.
+  \item \textbf{Theorem~\ref{thm:approx_flip} and Corollary~\ref{cor:vanishing_margin}.}
+    Vanishing margins make approximation errors destructive at scale: when score gaps
+    shrink with instance size, any fixed-accuracy model will eventually invert the
+    removal ordering.
+  \item \textbf{Theorem~\ref{thm:propagation}.} Ordering errors compound: a single
+    wrong deletion sends the decoder onto a structurally different residual graph,
+    after which errors are unbounded.
+  \item \textbf{Lemma~\ref{lem:local_gradient_correction} and
+    Theorem~\ref{thm:gu_positive}.} The gradient provides an exact local correction:
+    deleting a vertex changes each surviving gradient coordinate by a local quantity,
+    which a learned updater can represent exactly in its first linear layer.
+  \item \textbf{Theorem~\ref{thm:cached_gradient_complexity}.} Cached sufficient
+    statistics recover $O(n^2)$ decoding: maintaining $(\mathbf{A}p, \mathbf{B}p,
+    \sum p_i)$ with $O(n)$ per-deletion updates gives $O(n^2)$ total cost after the
+    initial GNN pass.
+\end{itemize}
+
+
+
+On the empirical side, we introduce a learned score updater decoder (UPR) that runs
+the GNN once and updates scores incrementally via $U_\theta$, and a corresponding
+training regime (PR) that supervises $U_\theta$ by imitating a rerun-based teacher.
+Both are described in full in Section~\ref{sec:method}. Our findings:
+\begin{itemize}
+  \item \textbf{Running time.} UPR reduces decoding from $O(n^3)$ to $O(n^2)$
+    with no loss in approximation ratio relative to the rerun baseline.
+  \item \textbf{Recovery quality.} SGNN+GU under PR training achieves perfect
+    approximation and exact recovery on Easy and Medium regimes, matching the
+    $O(n^3)$ rerun baseline at $O(n^2)$ cost.
+  \item \textbf{Necessity of the gradient channel.} Removing the gradient from
+    $U_\theta$ collapses incremental performance even under PR training, confirming
+    that the gradient is a necessary architectural condition, not merely a helpful
+    signal.
+  \item \textbf{Ablation over training regimes and decoders.} Objective-only
+    training with the gradient channel already substantially improves over standard
+    GNNs; PR training recovers the rerun baseline entirely. Without the gradient,
+    PR training makes performance strictly worse than objective training alone.
+\end{itemize}
+
+% On the empirical side, we evaluate on planted clique across an ablation of training regimes and decoder processes. The gradient channel is both necessary and sufficient: removing it collapses
+% performance even under explicit imitation training, while providing it with
+% cached-deletion maintenance recovers the $O(n^3)$ rerun baseline at $O(n^2)$ cost, with the same approximation ratio.
+
+\paragraph{Paper organization.}
+Section~\ref{sec:related} reviews related work. Section~\ref{sec:method} develops
+the methodology. Section~\ref{sec:theory} presents the theoretical analysis.
+Section~\ref{sec:experiments} presents the empirical evaluation.
+Section~\ref{sec:discussion} concludes.
+
+% ============================================================
+\section{Related Work}
+\label{sec:related}
+% ============================================================
+
+\paragraph{Message-passing GNNs.}
+A message-passing neural network (MPNN) maintains a hidden state
+$h_v^{(\ell)} \in \mathbb{R}^d$ updated over $L$ layers as
+\[
+  h_v^{(\ell+1)}
+  =
+  \sigma\!\left(
+    \mathbf{M}\!\left[
+      h_v^{(\ell)},\,
+      \mathrm{Agg}_{u\in\mathcal{N}(v)} h_u^{(\ell)}
+    \right]
+  \right),
+\]
+with a per-vertex score $z_v = \mathbf{W}_{\mathrm{out}} h_v^{(L)}$ read off at the
+end~\citep{xu2019}. Their expressive power is bounded by the 1-WL test~\citep{xu2019,
+morris2019}, though our results concern an orthogonal limitation---\emph{update
+compatibility}---that persists even beyond the WL bound. Since these networks
+ultimately output vertex scores, a natural question is whether those scores resemble
+the heuristics used by classical algorithms.
+
+\paragraph{What GNNs learn on combinatorial problems.}
+This score-based view connects directly to recent interpretability results.
+\citet{cappart2023} argue that GNNs on NP-hard problems behave more like
+polynomial-time heuristics than exact solvers, and \citet{shoham2026ltr} give a
+concrete \textsc{Max-Clique} example: across architectures and datasets, learned
+representations consistently recover degree-based vertex rankings. At first glance,
+this is exactly what one would hope for, since degree is the canonical statistic behind
+fast residual clique heuristics. The difficulty is that a useful residual heuristic is
+not only a good ranking rule; it is also a rule whose state can be updated cheaply
+after each deletion. Our work shows that this second property does not automatically
+transfer from degree to a nonlinear GNN score.
+
+\paragraph{GNNs for combinatorial optimization.}
+The issue becomes central in neural combinatorial optimization, where learned scores
+are routinely placed inside residual decoders. \citet{karalias2020} introduced an
+unsupervised framework deriving GNN loss directly from the problem objective;
+\citet{min2022} extended this with the scattering-based architecture we build on.
+Similar unsupervised objectives have been applied to \textsc{Max-Cut},
+\textsc{Max-Independent-Set}, and \textsc{TSP}~\citep{schuetz2022,garmendia2024}.
+These works show that GNN scores can guide strong combinatorial heuristics, but the
+standard decoding pattern still reruns or reuses the network in a residual loop. That
+loop is precisely where update compatibility and the vanishing-margin obstruction
+(Theorem~\ref{thm:approx_flip}) become critical. This points to a broader design
+principle: neural solvers should align not only with the objective they optimize, but
+also with the algorithmic update structure used at inference time.
+
+\paragraph{Architectural alignment with algorithms.}
+This principle is visible in recent work on algorithm-aligned architectures.
+\citet{yau2023} (OptGNN) proved that polynomial-sized MPNNs can implement SDP
+gradient descent for Max-CSPs, obtaining UGC-optimal guarantees in theory and
+outperforming SDP solvers in practice. Our work is complementary: OptGNN aligns
+message passing with the dynamics of a convex relaxation, whereas we align the
+residual decoder with the local objective change caused by a deletion. Thus the
+algorithmic object we need is not a full relaxation trajectory, but a live marginal
+signal that can be updated as the residual graph changes.
+
+\paragraph{Gradient and marginal signals in neural solvers.}
+Several recent neural solvers also enrich message passing with dynamic marginal or
+algorithmic signals. QRF-GNN~\citep{gaile2024} feeds intermediate GNN predictions
+back as dynamic node features to improve convergence within a single inference
+pass---structurally related to our gradient channel, but targeting a different goal.
+\citet{hadou2024} unroll a dual ascent algorithm into coupled networks so each layer
+computes a meaningful algorithmic step. Our approach differs from both: we expose the
+objective gradient as a live residual coordinate and let the model learn how to use
+it, with the additional structural contribution that the gradient is maintained
+exactly in $O(n)$ per deletion via cached sufficient statistics. This leaves a second
+question: how should the updater learn to turn this maintained signal into the same
+decisions a full rerun would make?
+
+\paragraph{Imitation and self-supervised decoding.}
+This training question connects our PR regime to imitation learning in combinatorial
+optimization~\citep{liu2021}, where a GNN is trained to replicate a stronger
+algorithm's decisions. The novelty here is self-imitation: teacher and student share
+weights, and the student must predict the rerun-based removal sequence from
+incrementally updated scores using the cached gradient.
+
+% ============================================================
+\section{Methodology}
+\label{sec:method}
+% ============================================================
+
+We evaluate three model families:
+\[
+  \text{SGNN},\qquad
+  \text{SGNN+U},\qquad
+  \text{SGNN+GU}.
+\]
+SGNN is a standard message-passing GNN. SGNN+U adds a learned score updater
+$U_\theta$ without gradient access. SGNN+GU provides $U_\theta$ with the current
+cached objective gradient. The central question is whether the gradient channel is
+necessary, sufficient, or both for efficient incremental decoding.
+
+\subsection{Problem Setting}
+\label{sec:problem}
+
+We evaluate on planted clique on $G(n,\tfrac{1}{2},k)$ random graphs. To sample
+the Erd\H{o}s--R\'enyi background, each unordered vertex pair is included
+independently with probability $1/2$. We then choose $k$ vertices uniformly at random
+and add all missing edges among them, forming the planted clique $C^\star$. The goal
+is to recover a large valid clique, ideally $C^\star$. Following~\citet{shoham2026ltr},
+we partition instances by known theoretical thresholds:
+\begin{itemize}
+  \item \textbf{Easy} ($k\in[62,100]$, $n=1000$): degree-based heuristics
+    succeed~\citep{kucera1995}.
+  \item \textbf{Medium} ($k\in[36,61]$): requires iterative residual
+    methods~\citep{alon1998, feige2010}.
+  \item \textbf{Hard} ($k\in[20,35]$): no polynomial-time algorithm is known to
+    succeed~\citep{manurangsi2021}.
+\end{itemize}
+
+\paragraph{Metrics.}
+We evaluate solution quality and representation structure through five complementary
+measures.
+
+\textit{Approximation ratio} $= |C_{\text{found}}|/|C^\star|$ measures the size of
+the recovered clique relative to the planted clique. A ratio of $1.0$ means the
+decoder found a clique at least as large as the planted one, though not necessarily
+identical to it.
+
+\textit{Overlap} $= |C_{\text{found}} \cap C^\star|/|C^\star|$ measures what
+fraction of the planted clique vertices were actually recovered. Unlike approximation
+ratio, overlap is sensitive to whether the correct vertices were found, not just
+whether a large clique was found.
+
+\textit{Exact recovery} $= \mathbf{1}[C_{\text{found}} = C^\star]$ is the strictest
+criterion: the recovered clique must be identical to the planted one.
+
+\textit{Explained variance} of the first two principal components (PC1, PC2) of the
+final GNN hidden layer $h_v^{(L)}$, computed via PCA across all vertices. Following
+\citet{shoham2026ltr}, PC1 typically captures over $95\%$ of the variance,
+revealing whether the learned representation collapses onto a dominant scalar
+ordering direction.
+
+\textit{Spearman correlation} $\rho$ between degree and the PC1 projection of
+$h_v^{(L)}$, and between degree and the output scores $s_v$. A high $|\rho|$
+indicates that the model has learned a degree-based ranking, consistent with the
+classical LPR heuristic~\citep{shoham2026ltr}. We also report $\rho$ between the
+post-update scores $\tilde{s}_v$ (after one application of $U_\theta$) and degree,
+to measure whether the gradient update preserves or disrupts the learned ranking.
+
+\subsection{Model Architecture}
+\label{sec:architectures}
+
+All models share the same message-passing backbone: $L=4$ shared message-passing
+steps, hidden dimension $64$, and $\sigma=\tanh$. The input feature is a scalar
+liveness indicator; no degree, clique-membership, or structural feature is provided.
+
+\paragraph{Standard GNN (SGNN).}
+The input feature is first projected as $h_v^{(0)} = W_{\mathrm{in}} x_v + b_{\mathrm{in}}$,
+where $x_v \in \mathbb{R}$ is a scalar liveness indicator initialized to $1$. At layer $\ell$, SGNN
+aggregates neighbor representations and updates:
+\[
+  q_v^{(\ell)} = \frac{1}{n-1}\sum_{u\in\mathcal{N}(v)} h_u^{(\ell)},
+  \qquad
+  h_v^{(\ell+1)} = \sigma\!\left(M_{\mathrm{upd}}\!\left[h_v^{(\ell)},
+  q_v^{(\ell)}\right]\right),
+\]
+\[
+  s_v = W_{\mathrm{out}} h_v^{(L)} + b_{\mathrm{out}},
+  \qquad
+  p_v = \operatorname{sigmoid}(s_v),
+\]
+where $M_{\mathrm{upd}}$ is a two-layer MLP with hidden dimension $d$, $\sigma$
+is a nonlinear activation applied after each layer, $W_{\mathrm{out}}, b_{\mathrm{out}}$
+project the final hidden state to a scalar score after $L$ message-passing steps,
+and $p_v \in (0,1)$ is the vertex probability used by the clique objective.
+
+
+\paragraph{SGNN+U and SGNN+GU.}
+Both use the SGNN backbone and add a lightweight MLP updater $U_\theta$. After
+removing vertex $v^*$, each surviving score is updated as
+\[
+  s_i \leftarrow s_i + U_\theta(s_i,\, s_{v^*},\, A_{iv^*},\, \gamma_i,\, \gamma_{v^*}),
+\]
+where $s_i$ and $s_{v^*}$ are the current scores of vertex $i$ and the removed
+vertex, $A_{iv^*}$ is the adjacency indicator between them, and $\gamma_i,
+\gamma_{v^*}$ are gradient channels that differ between the two variants.
+For SGNN+U, $\gamma_i = \gamma_{v^*} = 0$: the updater receives no gradient
+information. For SGNN+GU,
+\[
+  \gamma_i = g_i = \frac{\partial \mathcal{L}_{\mathrm{clique}}}{\partial p_i},
+  \qquad
+  \gamma_{v^*} = g_{v^*} = \frac{\partial \mathcal{L}_{\mathrm{clique}}}{\partial p_{v^*}},
+\]
+where $g_i$ and $g_{v^*}$ are maintained via the cached sufficient statistics
+described in Section~\ref{sec:cached_maintenance}.
+
+\subsection{Cached Gradient Maintenance}
+\label{sec:cached_maintenance}
+
+Recomputing the full gradient after every deletion costs $O(n^2)$ per step and
+$O(n^3)$ total. For the clique objective, this is unnecessary. The gradient
+\[
+  g_i = -\frac{2(\mathbf{A}p)_i}{k(k-1)}
+  + \frac{2(\mathbf{B}p)_i}{k(n-k)}
+  + \frac{20(\sum_j p_j - k)}{n^2}
+\]
+depends only on three sufficient statistics $q^A = \mathbf{A}p$, $q^B = \mathbf{B}p$,
+$S = \sum_j p_j$. After deleting vertex $v$ with cached probability $p_v$, each
+statistic is updated by a single rank-one subtraction:
+\[
+  q^A \leftarrow q^A - \mathbf{A}_{:v}\,p_v,
+  \qquad
+  q^B \leftarrow q^B - \mathbf{B}_{:v}\,p_v,
+  \qquad
+  S \leftarrow S - p_v.
+\]
+This costs $O(n)$ per deletion. The cache is initialized in $O(n^2)$ alongside
+the initial GNN pass, so the total decoding cost remains $O(n^2)$
+(Theorem~\ref{thm:cached_gradient_complexity}).
+
+\subsection{Decoding Procedures}
+\label{sec:decoding}
+
+All decoders run the GNN once, then iteratively remove the lowest-scoring vertex
+until the remaining set forms a clique, followed by an add-back pass that restores
+any removed vertex compatible with the found clique. They differ only in how---and
+whether---scores are updated after each deletion.
+
+\paragraph{Top-$k$ ($O(n^2)$).}
+The GNN runs once. Vertices are ranked by score in descending order and greedily
+added to the solution: a vertex is included if it is adjacent to all previously
+selected vertices, stopping when $k$ vertices are found~\citep{shoham2026ltr}.
+No pruning loop is used.
+
+\paragraph{Rerun-Pruned ($O(n^3)$).}
+The full GNN is rerun on the current residual graph after every deletion to produce
+fresh scores. The lowest-scoring vertex is removed at each step until the remaining
+set forms a clique, followed by an add-back pass. This is the only $O(n^3)$ decoder
+and serves as the adaptive upper bound.
+
+\paragraph{LPR ($O(n^2)$).}
+The GNN runs once. Scores are never updated; the lowest-scoring vertex is removed
+at each step until a clique remains, followed by an add-back pass~\citep{shoham2026ltr}.
+
+\paragraph{UPR ($O(n^2)$).}
+The GNN runs once. After each deletion of $v^*$, $U_\theta$ updates all surviving
+scores. For SGNN+U, $U_\theta$ receives no gradient. For SGNN+GU, $U_\theta$
+receives the cached deletion-updated gradient, and the score update is gated to
+neighbors of $v^*$ only.
+
+\begin{algorithm}[t]
+  \caption{UPR: Cached-Deletion Decoder}
+  \label{alg:gub}
+  \begin{algorithmic}[1]
+    \State Run GNN once to obtain scores $s_i$ and probabilities $p_i$ for all $i$.
+    \State Build gradient cache from $\mathcal{L}$ and $p$. \hfill\Comment{$O(n^2)$}
+    \State $C \leftarrow V(G)$;\; $H \leftarrow []$.
+    \While{$C$ does not form a clique}
+    \State $v^* \leftarrow \arg\min_{i \in C} s_i$;\; append $v^*$ to $H$;\; $C \leftarrow C \setminus \{v^*\}$.
+    \State Remove $v^*$'s contribution from gradient cache. \hfill\Comment{$O(n)$, by Lemma~\ref{lem:local_gradient_correction}}
+    \State $g_i \leftarrow$ gradient from updated cache for all $i \in C$. \hfill\Comment{$O(n)$}
+    \State $s_i \mathrel{+}= U_\theta(s_i,\, s_{v^*},\, A_{iv^*},\, g_i,\, g_{v^*})$ for all $i \in C$. \hfill\Comment{$O(n)$}
+    \EndWhile
+    \For{$v$ from last to first in $H$}
+    \If{$C \cup \{v\}$ is a clique} $C \leftarrow C \cup \{v\}$. \EndIf
+    \EndFor
+    \State \Return $C$.
+  \end{algorithmic}
+\end{algorithm}
+
+\subsection{Training}
+\label{sec:training}
+
+All models are trained only on Medium-difficulty instances. Each run uses 64
+epochs, with 1000 newly sampled instances per epoch, minibatch size 32, and no
+overlap with the held-out evaluation instances. The unsupervised clique objective is
+\[
+  \mathcal{L}_{\mathrm{clique}}(p; A, k)
+  =
+  -\frac{p^\top \mathbf{A} p}{k(k-1)}
+  +
+  \frac{p^\top \mathbf{B} p}{k(n-k)}
+  +
+  10\!\left(\frac{\textstyle\sum_i p_i - k}{n}\right)^{\!2},
+\]
+where $p_i = \sigma(s_i)$ and $\mathbf{B}$ is the complement adjacency matrix.
+
+\paragraph{Objective training (OBJ).}
+$\mathcal{L}_{\mathrm{train}} = \mathcal{L}_{\mathrm{clique}}$. $U_\theta$ is
+supervised only through the objective, with no direct signal on the removal sequence.
+
+\paragraph{Probable-Remover training (PR).}
+PR adds an imitation loss that directly supervises the incremental decoder. At each
+step $t$, a rerun-based teacher reruns the GNN on the current residual graph $G_t$
+and selects the lowest-scoring vertex $v^t_{\mathrm{teach}}$. A student---running
+the GNN only once and updating scores incrementally via $U_\theta$---is penalised
+for disagreeing:
+\[
+  \mathcal{L}_{\mathrm{PR}} = \frac{1}{T} \sum_{t=0}^{T-1}
+  \mathrm{CE}_{\mathrm{softmax}}\!\left(-\tilde{s}^{(t)}_{V(G_t)},\;
+  v^t_{\mathrm{teach}}\right),
+  \qquad
+  \mathcal{L}_{\mathrm{train}} = \mathcal{L}_{\mathrm{clique}} +
+  \mathcal{L}_{\mathrm{PR}}.
+\]
+For SGNN+U, $U_\theta$ receives no gradient signal; it is trained purely through
+backpropagation of $\mathcal{L}_{\mathrm{PR}}$ with $\gamma_i = \gamma_{v^*} = 0$.
+For SGNN+GU, the cached gradient is updated in $O(n)$ after each teacher removal
+before being passed to $U_\theta$. The teacher cost is $O(n^3)$ per training
+instance, paid at train time only.
+
+\begin{algorithm}[t]
+  \caption{PR Training Step}
+  \label{alg:pr_training}
+  \begin{algorithmic}[1]
+    \State Sample instance $(G, k)$; run GNN once to obtain $\tilde{s}$, $p$.
+    \State Build gradient cache from $\mathcal{L}$ and $p$. \hfill\Comment{$O(n^2)$; SGNN+GU only}
+    \For{$t = 0, \ldots, T-1$}
+    \State $v^t_{\mathrm{teach}} \leftarrow \arg\min_{i \in V(G_t)} \mathrm{GNN}(G_t)_i$. \hfill\Comment{Teacher reruns GNN, $O(n^2)$}
+    \State $\mathcal{L}_{\mathrm{PR}} \mathrel{+}= \mathrm{CE}_{\mathrm{softmax}}(-\tilde{s}_{V(G_t)},\, v^t_{\mathrm{teach}})$. \hfill\Comment{Student predicts same removal}
+    \State $G_t \leftarrow G_t \setminus \{v^t_{\mathrm{teach}}\}$.
+    \State Update gradient cache by removing $v^t_{\mathrm{teach}}$. \hfill\Comment{$O(n)$; SGNN+GU only}
+    \State $\tilde{s}_i \mathrel{+}= U_\theta(\tilde{s}_i,\, \tilde{s}_{v^t},\, A_{iv^t},\, \gamma_i,\, \gamma_{v^t})$ for all $i \in V(G_t)$.
+    \EndFor
+    \State Optimise $\mathcal{L}_{\mathrm{clique}} + \mathcal{L}_{\mathrm{PR}} / T$.
+  \end{algorithmic}
+\end{algorithm}
+
+% ============================================================
+% ============================================================
+\section{Theoretical Analysis}
+\label{sec:theory}
+% ============================================================
+
+We develop the theory in three acts. The first shows why nonlinear GNN scores are
+structurally incompatible with efficient incremental decoding. The second identifies
+the objective gradient as the missing additive coordinate. The third shows how to
+maintain that coordinate in $O(n)$ per deletion.
+
+\paragraph{Act I: Why nonlinear scores fail.}
+The efficiency of classical residual algorithms rests on a simple algebraic fact: if
+removing a neighbor decreases degree by exactly $1$, and the score is $s_i =
+\varphi(d_i)$, then an exact additive update requires $\varphi(d-1) = \varphi(d) - c$
+for a fixed constant $c$. This forces $\varphi$ to be affine.
+
+\begin{theorem}[Affine encoding is necessary for exact additive updates]
+  \label{thm:affine}
+  Let $d_i \in \mathbb{Z}_{\geq 0}$ be an additive statistic decreasing by $1$ when
+  a neighbor is deleted. If the score $s_i = \varphi(d_i)$ satisfies
+  $\varphi(d-1) = \varphi(d) - c$ for a fixed constant $c$ and all relevant $d$,
+  then $\varphi(d) = cd + b$ for some $b \in \mathbb{R}$.
+\end{theorem}
+\begin{proof}[Proof sketch]
+  The condition pins every first discrete difference of $\varphi$ to the same
+  constant $c$, which forces $\varphi$ to be linear. Full proof in
+  Appendix~\ref{app:proofs}.
+\end{proof}
+
+
+GNNs with nonlinear activations cannot implement this: the score after a deletion
+passes through $\sigma$ on a different input than the score before, and since
+$\sigma$ is nonlinear, $\sigma(a - b) \neq \sigma(a) - \sigma(b)$ in general.
+No fixed additive correction can bridge this gap.
+
+\begin{theorem}[Nonlinear GNNs cannot implement exact additive updates]
+  \label{thm:nonlinear}
+  Let $f_\theta\colon\mathcal{G}\to\mathbb{R}^n$ be an MPNN with learned parameters
+  $\theta$, whose update MLPs contain at least one nonlinear activation $\sigma$. Then for any fixed $c$,
+  there exist $G$ and adjacent $u,v$ such that $f_\theta(G)_v - c \neq
+  f_\theta(G\setminus\{u\})_v$ regardless of $\theta$.
+\end{theorem}
+\begin{proof}
+  By Theorem~\ref{thm:affine}, exact updates require $f_\theta(G)_v$ to be affine
+  in $d_v$. But $f_\theta(G)_v$ is a composition of $\sigma$ with linear
+  functions of the neighborhood aggregation. Since $\sigma$ is nonlinear,
+  $\sigma(a - b) \neq \sigma(a) - \sigma(b)$ in general: the score after a
+  deletion is not the score before minus a fixed constant. No choice of $\theta$
+  can eliminate this gap, because it is a consequence of the nonlinearity of
+  $\sigma$ itself, not of the parameter values.
+\end{proof}
+
+
+% \begin{remark}
+%   The impossibility is also statistical: any strictly increasing reparametrisation
+%   $\varphi(d_i)$ satisfies the same pairwise ranking constraints as $d_i$, so
+%   ranking supervision cannot enforce the additive scale that exact updates require.
+% \end{remark}
+
+The failure is not merely local. As instance size grows, score gaps between adjacent
+candidates vanish. A fixed approximation error then suffices to invert the removal
+ordering, and a single inversion sends the two decoders onto structurally different
+residual graphs from which there is no recovery.
+
+
+
+
+
+
+
+
+
+\begin{theorem}[Approximate scores induce ordering errors at scale]
+  \label{thm:approx_flip}
+  Let $\hat{s}_i^{(n)} = s_i^{(n)} + \varepsilon_i^{(n)}$ and let $\gamma_n :=
+  \min_{i\neq j}|s_i^{(n)} - s_j^{(n)}|$ be the minimum nonzero score gap. If
+  each removal step introduces a fixed nonzero error $\varepsilon > 0$, then after
+  $r = \lceil \gamma_n / \varepsilon \rceil$ steps the accumulated error crosses
+  $\gamma_n$ and a pairwise ordering is inverted.
+\end{theorem}
+\begin{proof}[Proof sketch]
+  Each removal adds $\varepsilon$ to the cumulative score error. After $r$ steps
+  the total error is $r\varepsilon$. Once $r\varepsilon > \gamma_n$, the error
+  exceeds the closest score gap and the wrong vertex is removed. Since $\varepsilon
+  > 0$ is fixed and the trajectory length grows with $n$, this crossing is
+  inevitable. Full proof in Appendix~\ref{app:proofs}.
+\end{proof}
+
+\begin{corollary}[Any fixed approximation error eventually causes a flip]
+  \label{cor:vanishing_margin}
+  For any nonlinear GNN score with irreducible per-step approximation error,
+  the accumulated error will eventually exceed the minimum score gap $\gamma_n$,
+  inverting the removal ordering. Exact additive coordinates are the only
+  structural remedy: they update the score algebraically and incur no approximation
+  error per step.
+\end{corollary}
+\begin{proof}[Proof sketch]
+  Immediate from Theorem~\ref{thm:approx_flip}: with fixed $\varepsilon > 0$ and
+  trajectory length growing with $n$, the accumulated error $r\varepsilon$
+  eventually exceeds $\gamma_n$ for any instance large enough.
+\end{proof}
+
+
+\begin{theorem}[Local ordering errors cascade into trajectory divergence]
+  \label{thm:propagation}
+  If at step $t$ estimated scores invert the ordering of $i$ and $j$, the two
+  decoders remove different vertices. All subsequent score discrepancies equal
+  differences between GNN outputs on structurally different graphs and can be
+  arbitrarily large.
+\end{theorem}
+\begin{proof}[Proof sketch]
+  After the inversion, vertex $i$ is present in one residual graph and absent from
+  the other. Every future score is computed on a different input; the deviation is
+  no longer a perturbation of the original error vector but an uncontrolled
+  structural difference. Full proof in Appendix~\ref{app:proofs}.
+\end{proof}
+
+
+
+
+Together, Theorems~\ref{thm:affine}--\ref{thm:propagation} establish that no
+nonlinear GNN can support cheap incremental decoding from its raw score alone, and
+that the damage compounds rather than dissipates.
+
+\paragraph{Act II: The gradient as an additive coordinate.}
+The obstruction rules out efficient decoding from the raw score, not from a
+richer signal. For any locally decomposable objective, deleting a vertex removes
+exactly its local contribution from each surviving gradient coordinate---a
+correction determined entirely by the local factor between the deleted vertex and
+each survivor.
+
+\begin{lemma}[Local deletion gives a local gradient correction]
+  \label{lem:local_gradient_correction}
+  Let \[\mathcal{L}(p;G) = \sum_i \phi_i(p_i) + \sum_{(i,j)\in F(G)}
+  \psi_{ij}(p_i,p_j,A_{ij})\] and $g_i(G) = \partial\mathcal{L}/\partial p_i$.
+  After deleting vertex $v$,
+  \[
+    g_i(G\setminus\{v\}) - g_i(G)
+    =
+    -\frac{\partial \psi_{iv}(p_i,p_v,A_{iv})}{\partial p_i},
+  \]
+  with the right-hand side zero when $(i,v)\notin F(G)$.
+\end{lemma}
+\begin{proof}[Proof sketch]
+  Differentiating the sum, every term except $\psi_{iv}$ survives deletion of $v$
+  unchanged. The correction is therefore exactly the removed local derivative.
+  Full proof in Appendix~\ref{app:proofs}.
+\end{proof}
+
+For quadratic objectives this correction is an affine function of $(A_{iv}, p_v)$,
+both of which are available to a learned updater. This is the key representability
+result.
+
+\begin{theorem}[Gradient-updater representability]
+  \label{thm:gu_positive}
+  For quadratic objectives $\mathcal{L}=\sum_r\alpha_r p^\top M_r p$, the
+  deletion correction is
+  \[
+    \Delta g_i(v) = -2\sum_r\alpha_r(M_r)_{iv}\,p_v,
+  \]
+  a linear function of $(A_{iv}, p_v)$. An updater $U_\theta$ receiving gradient
+  information can represent $\Delta g_i$ exactly in its first linear layer, before
+  any nonlinear activation fires.
+\end{theorem}
+\begin{proof}[Proof sketch]
+  The correction is linear in the inputs already available to $U_\theta$; no
+  nonlinear inversion of $\sigma$ is required. Without $g_i$, recovering $\Delta
+  g_i$ from $\sigma(z_v)$ requires inverting $\sigma$, which
+  Theorem~\ref{thm:nonlinear} shows is impossible with a fixed additive rule. Full
+  proof in Appendix~\ref{app:proofs}.
+\end{proof}
+
+\paragraph{Act III: Cached maintenance recovers $O(n^2)$.}
+The gradient correction is cheap to maintain. For the clique objective, $g_i$
+depends only on three sufficient statistics $(\mathbf{A}p, \mathbf{B}p, \sum p_j)$.
+Each deletion subtracts the deleted vertex's column contribution from these
+statistics in $O(n)$, and the updated gradient is read off in $O(n)$ with no
+matrix operations.
+
+\begin{theorem}[Cached gradient maintenance yields $O(n^2)$ decoding]
+  \label{thm:cached_gradient_complexity}
+  The sufficient statistics $(\mathbf{A}p, \mathbf{B}p, \sum_i p_i)$ are
+  initialized in $O(n^2)$. Each deletion updates them in $O(n)$ by subtracting the
+  deleted vertex's column contribution. Over $n$ deletions the total update cost is
+  $O(n^2)$, matching the initial GNN pass.
+\end{theorem}
+\begin{proof}[Proof sketch]
+  Initialization requires two matrix-vector products at $O(n^2)$ each. Each
+  deletion subtracts two length-$n$ vectors and one scalar at $O(n)$. Summing over
+  at most $n$ deletions gives $O(n^2)$. Full proof in Appendix~\ref{app:proofs}.
+\end{proof}
+
+\begin{remark}
+  The cache tracks gradient changes due to vertex deletions only, not score drift
+  from $U_\theta$. It should be understood as a deletion-updated residual signal,
+  not as the exact gradient of the current score vector after each learned update.
+\end{remark}
+
+The explicit clique-gradient correction used at each step is:
+\begin{equation}
+  \label{eq:clique_correction}
+  \Delta g_i(v)
+  =
+  \frac{2A_{iv}p_v}{k(k-1)}
+  -
+  \frac{2B_{iv}p_v}{k(n-k)}
+  -
+  \frac{20p_v}{n^2},
+\end{equation}
+read in $O(1)$ per entry from the updated cache after the $O(n)$ column subtraction.
+
+
+
+
+% ============================================================
+\section{Experiments}
+\label{sec:experiments}
+% ============================================================
+
+\subsection{Setup}
+We use the architectures from Section~\ref{sec:architectures} and the training
+protocol from Section~\ref{sec:training}. All experiments use planted-clique
+instances with $n=1000$; evaluation set sizes are reported in the table captions.
+Unless otherwise stated, reported values are mean $\pm$ standard deviation over
+the corresponding held-out instances. Hardware: AMD Ryzen 9 5950X, 64\,GB RAM, NVIDIA RTX 3080;
+Python 3.11, PyTorch 2.2.
+
+\subsection{Main Results}
+\label{sec:main_results}
+
+Table~\ref{tab:main} reports planted clique recovery across all model and decoder
+combinations.
+
+\begin{table}[t]
+  \centering
+  \caption{Planted clique recovery on $n=1000$ across Easy, Medium, and Hard
+    regimes, reported as mean$\,\pm\,$std over 10 held-out instances per regime;
+    entries without $\pm$ are exactly $0.00$ or $1.00$ across all instances.
+    \textbf{Bold} marks the highlighted best results: SGNN+GU+PR with
+    UPR is the strongest $O(n^2)$ incremental decoder on Easy and Medium, while
+    SGNN+U+PR with Rerun is best on Hard. Runtime reports asymptotic decoding cost:
+    all decoders are $O(n^2)$ except Rerun, which is $O(n^3)$. SGNN has no updater and
+  cannot run UPR.}
+  \label{tab:main}
+  \resizebox{\textwidth}{!}{%
+    \begin{tabular}{lllccccccccc}
+      \toprule
+      & & & \multicolumn{3}{c}{Easy} & \multicolumn{3}{c}{Medium}
+      & \multicolumn{3}{c}{Hard} \\
+      \cmidrule(lr){4-6}\cmidrule(lr){7-9}\cmidrule(lr){10-12}
+      Model & Decoder & Runtime & Approx & Overlap & Exact
+      & Approx & Overlap & Exact
+      & Approx & Overlap & Exact \\
+      \midrule
+      \multirow{3}{*}{SGNN + OBJ}
+      & Top-$k$   & $O(n^2)$ & $1.00$ & $1.00$ & $1.00$
+      & $0.75{\pm}0.43$ & $0.74{\pm}0.45$ & $0.67{\pm}0.58$
+      & $0.46{\pm}0.12$ & $0.08{\pm}0.07$ & $0.00$ \\
+      & Rerun     & $O(n^3)$ & $1.00$ & $1.00$ & $1.00$
+      & $1.00$ & $1.00$ & $1.00$
+      & $0.49{\pm}0.09$ & $0.00$ & $0.00$ \\
+      & LPR       & $O(n^2)$ & $1.00$ & $1.00$ & $1.00$
+      & $0.75{\pm}0.43$ & $0.74{\pm}0.45$ & $0.67{\pm}0.58$
+      & $0.46{\pm}0.12$ & $0.08{\pm}0.07$ & $0.00$ \\
+      \midrule
+      \multirow{4}{*}{SGNN+U + OBJ}
+      & Top-$k$   & $O(n^2)$ & $1.00$ & $1.00$ & $1.00$
+      & $0.62{\pm}0.36$ & $0.58{\pm}0.40$ & $0.33{\pm}0.58$
+      & $0.37{\pm}0.06$ & $0.08{\pm}0.07$ & $0.00$ \\
+      & Rerun     & $O(n^3)$ & $1.00$ & $1.00$ & $1.00$
+      & $1.00$ & $1.00$ & $1.00$
+      & $0.63{\pm}0.33$ & $0.36{\pm}0.56$ & $0.33{\pm}0.58$ \\
+      & LPR       & $O(n^2)$ & $1.00$ & $1.00$ & $1.00$
+      & $0.62{\pm}0.36$ & $0.58{\pm}0.40$ & $0.33{\pm}0.58$
+      & $0.37{\pm}0.06$ & $0.08{\pm}0.07$ & $0.00$ \\
+      & UPR       & $O(n^2)$ & $0.13{\pm}0.01$ & $0.00$ & $0.00$
+      & $0.17{\pm}0.01$ & $0.00$ & $0.00$
+      & $0.34{\pm}0.09$ & $0.00$ & $0.00$ \\
+      \midrule
+      \multirow{4}{*}{SGNN+GU + OBJ}
+      & Top-$k$   & $O(n^2)$ & $1.00$ & $1.00$ & $1.00$
+      & $1.00$ & $1.00$ & $1.00$
+      & $0.48{\pm}0.06$ & $0.06{\pm}0.03$ & $0.00$ \\
+      & Rerun     & $O(n^3)$ & $1.00$ & $1.00$ & $1.00$
+      & $1.00$ & $1.00$ & $1.00$
+      & $0.54{\pm}0.08$ & $0.06{\pm}0.02$ & $0.00$ \\
+      & LPR       & $O(n^2)$ & $1.00$ & $1.00$ & $1.00$
+      & $1.00$ & $1.00$ & $1.00$
+      & $0.50{\pm}0.05$ & $0.05{\pm}0.05$ & $0.00$ \\
+      & UPR       & $O(n^2)$ & $0.12{\pm}0.00$ & $0.00{\pm}0.01$ & $0.00$
+      & $0.18{\pm}0.02$ & $0.00$ & $0.00$
+      & $0.42{\pm}0.04$ & $0.00$ & $0.00$ \\
+      \midrule
+      \multirow{4}{*}{SGNN+U + PR}
+      & Top-$k$   & $O(n^2)$ & $1.00$ & $1.00$ & $1.00$
+      & $0.55{\pm}0.40$ & $0.48{\pm}0.47$ & $0.33{\pm}0.58$
+      & $0.34{\pm}0.11$ & $0.04{\pm}0.01$ & $0.00$ \\
+      & Rerun     & $O(n^3)$ & $1.00$ & $1.00$ & $1.00$
+      & $1.00$ & $1.00$ & $1.00$
+      & $\mathbf{0.82{\pm}0.31}$ & $\mathbf{0.67{\pm}0.58}$ & $\mathbf{0.67{\pm}0.58}$ \\
+      & LPR       & $O(n^2)$ & $1.00$ & $1.00$ & $1.00$
+      & $0.55{\pm}0.40$ & $0.48{\pm}0.47$ & $0.33{\pm}0.58$
+      & $0.34{\pm}0.11$ & $0.04{\pm}0.01$ & $0.00$ \\
+      & UPR       & $O(n^2)$ & $0.11{\pm}0.01$ & $0.00$ & $0.00$
+      & $0.18{\pm}0.03$ & $0.00$ & $0.00$
+      & $0.29{\pm}0.04$ & $0.00$ & $0.00$ \\
+      \midrule
+      \multirow{4}{*}{SGNN+GU + PR}
+      & Top-$k$   & $O(n^2)$ & $1.00$ & $1.00$ & $1.00$
+      & $1.00$ & $1.00$ & $1.00$
+      & $0.47{\pm}0.05$ & $0.02{\pm}0.03$ & $0.00$ \\
+      & Rerun     & $O(n^3)$ & $1.00$ & $1.00$ & $1.00$
+      & $1.00$ & $1.00$ & $1.00$
+      & $0.50{\pm}0.07$ & $0.03{\pm}0.03$ & $0.00$ \\
+      & LPR       & $O(n^2)$ & $1.00$ & $1.00$ & $1.00$
+      & $0.46{\pm}0.21$ & $0.37{\pm}0.33$ & $0.00$
+      & $0.47{\pm}0.05$ & $0.02{\pm}0.03$ & $0.00$ \\
+      & UPR       & $O(n^2)$ & $\mathbf{1.00}$ & $\mathbf{1.00}$ & $\mathbf{1.00}$
+      & $\mathbf{1.00}$ & $\mathbf{1.00}$ & $\mathbf{1.00}$
+      & $0.48{\pm}0.09$ & $0.04{\pm}0.04$ & $0.00$ \\
+      \bottomrule
+    \end{tabular}%
+  }
+\end{table}
+
+
+\paragraph{Rerun decoding is strong but expensive.}
+Rerun decoding gives perfect Easy and Medium recovery for every model,
+confirming that a strong GNN ranking suffices when fresh scores are available after
+every deletion~\citep{shoham2026ltr}. Its cost is consistently higher:
+Table~\ref{tab:timing} reports $0.76$--$0.78$\,s per instance for rerun,
+compared with $0.20$--$0.21$\,s for LPR and $0.37$--$0.57$\,s for UPR decoder.
+
+
+\paragraph{Without the gradient channel, UPR collapses.}
+SGNN+U can still rank vertices reasonably under Top-$k$ and LPR, but its updater
+does not work as a residual decoder. UPR stays near zero exact recovery: on Easy
+it reaches only $0.11-0.13{\pm}0.01$ under differet training regimes, while on
+Medium it remains at $0.00$. Only Rerun restores perfect Easy/Medium recovery,
+at the cost of recomputing the GNN after every deletion. PR supervision alone is
+therefore not enough without the gradient channel, and can even hurt UPR decoder.
+
+
+\paragraph{The gradient channel is necessary and PR makes it usable.}
+SGNN+GU under objective-only training still performs poorly under UPR decoder
+($0.12-0.18{\pm}0.02$ on Easy/Medium), showing that the
+gradient channel alone is not enough---the model must also be trained to use it
+via PR training. Adding PR training transforms UPR decoding to perfect approximation,
+overlap, and exact recovery on Easy and Medium. The gradient channel makes the PR
+training objective achievable; PR training drives the model to exploit the gradient
+signal at decoding time.
+
+%  Probably remove!
+\paragraph{PR training trades static ranking for update quality.}
+For SGNN+GU, PR training hurts LPR ($1.00\to0.46$ on Medium) while enabling
+perfect UPR recovery ($1.00$). The model sacrifices one-pass score quality to
+learn an effective incremental update. For SGNN+U this trade-off does not occur:
+without the gradient channel, PR training cannot teach $U_\theta$ a useful update
+rule, so both LPR and UPR remain poor.
+
+
+\paragraph{Hard regime.}
+Hard instances remain difficult for all models, consistent with the planted clique
+hardness conjecture~\citep{manurangsi2021}. The strongest Hard result overall is
+SGNN+U+PR with rerun decoding, which reaches $0.82{\pm}0.31$ approximation but
+requires $O(n^3)$ time. Among $O(n^2)$ decoders, Hard is not solved reliably:
+SGNN+GU+OBJ with LPR has the highest approximation at $0.50{\pm}0.05$, while
+SGNN+GU+PR with UPR is the strongest UPR variant at $0.48{\pm}0.09$.
+
+\begin{table}[t]
+  \centering
+  \caption{Wall-clock time in seconds per instance on planted-clique graphs with
+    $n=1000$, reported as mean $\pm$ standard deviation over 1000 held-out instances
+  per regime and averaged over the Easy, Medium, and Hard regimes.}
+  \label{tab:timing}
+  \begin{tabular}{lcccc}
+    \toprule
+    Model & Top-$k$ & Rerun & LPR & UPR \\
+    \midrule
+    SGNN + OBJ      & 0.06 & 0.78 & 0.21 & --- \\
+    SGNN+U + OBJ    & 0.06 & 0.77 & 0.20 & 0.38 \\
+    SGNN+GU + OBJ   & 0.06 & 0.78 & 0.21 & 0.57 \\
+    SGNN+U + PR     & 0.06 & 0.76 & 0.20 & 0.37 \\
+    SGNN+GU + PR    & 0.06 & 0.76 & 0.20 & 0.54 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+
+\subsection{Embedding Geometry}
+\label{sec:pca}
+
+Table~\ref{tab:pca} reports PCA diagnostics and Spearman correlations on the final
+GNN hidden layer and scalar outputs.
+
+\begin{table}[t]
+  \centering
+  \caption{Representation diagnostics on 1000 held-out test instances per regime
+    ($n=1000$), reported as $|\rho|\pm\sigma$ (mean absolute Spearman $\pm$ std,
+    all $p=0$ to machine precision unless noted).
+    PC1/PC2: variance explained by the first two principal components of $h_v^{(L)}$.
+    $|\rho|(\text{PC1},\text{deg})$ and $|\rho|(\text{logits},\text{deg})$: absolute
+    Spearman between PC1 / output logits and residual degree.
+    These four quantities are identical across all models, training regimes, and
+    difficulty regimes: PC1$=1.00$, PC2$=0.00$,
+    $|\rho|(\text{PC1},\text{deg})=1.00\pm0.00$,
+    $|\rho|(\text{logits},\text{deg})=1.00\pm0.00$.
+    $|\rho|(\tilde{s},\text{deg})$: absolute Spearman between post-update scores and
+    residual degree after one application of $U_\theta$ (E$=$Easy, M$=$Medium,
+    H$=$Hard). Despite similar global $|\rho|$ values across models at step~1,
+    only SGNN+GU+PR avoids removing above-median-degree vertices during UPR:
+    \emph{Above-med.}\ reports the fraction of UPR removals where the removed
+    vertex has residual degree strictly above the alive median (medium regime,
+    $n{=}10$ graphs $\times$ 500 steps, pooled over all steps; k-less autograd).
+  SGNN has no updater and cannot run UPR.}
+  \label{tab:pca}
+  \resizebox{\textwidth}{!}{%
+    \begin{tabular}{llcccccccccccccc}
+      \toprule
+      & & \multicolumn{2}{c}{PC var.} &
+      \multicolumn{3}{c}{$|\rho|(\text{PC1},\text{deg})$} &
+      \multicolumn{3}{c}{$|\rho|(\text{logits},\text{deg})$} &
+      \multicolumn{3}{c}{$|\rho|(\tilde{s},\text{deg})$} &
+      \multicolumn{2}{c}{Above-med.\ (\%)} \\
+      \cmidrule(lr){3-4}\cmidrule(lr){5-7}\cmidrule(lr){8-10}\cmidrule(lr){11-13}\cmidrule(lr){14-15}
+      Model & Train & PC1 & PC2 & E & M & H & E & M & H & E & M & H & Pooled & Mean$\pm$std \\
+      \midrule
+      SGNN & OBJ
+      & 1.00 & 0.00
+      & $1.00\pm0.00$ & $1.00\pm0.00$ & $1.00\pm0.00$
+      & $1.00\pm0.00$ & $1.00\pm0.00$ & $1.00\pm0.00$
+      & \multicolumn{3}{c}{--- (no updater)}
+      & \multicolumn{2}{c}{---} \\
+      \midrule
+      \multirow{2}{*}{SGNN+U}
+      & OBJ
+      & 1.00 & 0.00
+      & $1.00\pm0.00$ & $1.00\pm0.00$ & $1.00\pm0.00$
+      & $1.00\pm0.00$ & $1.00\pm0.00$ & $1.00\pm0.00$
+      & $0.52\pm0.01$ & $0.52\pm0.01$ & $0.50\pm0.01$
+      & --- & --- \\
+      & PR
+      & 1.00 & 0.00
+      & $1.00\pm0.00$ & $1.00\pm0.00$ & $1.00\pm0.00$
+      & $1.00\pm0.00$ & $1.00\pm0.00$ & $1.00\pm0.00$
+      & $0.50\pm0.04$ & $0.50\pm0.03$ & $0.49\pm0.02$
+      & $49.7$ & $49.7\pm2.5$ \\
+      \midrule
+      \multirow{2}{*}{SGNN+GU}
+      & OBJ
+      & 1.00 & 0.00
+      & $1.00\pm0.00$ & $1.00\pm0.00$ & $1.00\pm0.00$
+      & $1.00\pm0.00$ & $1.00\pm0.00$ & $1.00\pm0.00$
+      & $0.51\pm0.01$ & $0.47\pm0.03$ & $0.36\pm0.17$
+      & --- & --- \\
+      & PR
+      & 1.00 & 0.00
+      & $1.00\pm0.00$ & $1.00\pm0.00$ & $1.00\pm0.00$
+      & $1.00\pm0.00$ & $1.00\pm0.00$ & $1.00\pm0.00$
+      & $0.49\pm0.03$ & $0.49\pm0.04$ & $0.51\pm0.02$
+      & $\mathbf{0.0}$ & $\mathbf{0.0\pm0.0}$ \\
+      \bottomrule
+  \end{tabular}}
+\end{table}
+
+
+\paragraph{The GNN output is perfectly degree-ranked.}
+The strongest signal is already present before any updater is applied: the final
+GNN output logits have absolute Spearman correlation $1.00{\pm}0.00$ with vertex
+degree across all models and regimes. Thus the backbone output learns a perfect
+degree ranking, up to orientation, regardless of architecture or training regime.
+The embeddings show the same collapse: PC1 explains essentially all variance
+(PC1$=1.00$, PC2$=0.00$), matching the degree-collapse finding
+of~\citet{shoham2026ltr}.
+
+% TODO add table for this
+\paragraph{The update disrupts degree alignment.}
+After one application of $U_\theta$, the absolute Spearman correlation between
+residual degree and updated scores drops to $0.36$--$0.52$ across updater variants
+and regimes. This is not necessarily a failure: degree ranking is useful for the
+initial GNN score, but the update is meant to track residual removal information,
+not preserve raw degree order. SGNN+GU+PR achieves perfect Easy/Medium UPR recovery
+despite only moderate degree alignment after the update, indicating that the
+successful updater is using gradient-informed information not captured by degree
+alone.
+
+
+% \paragraph{SGNN+U and SGNN+GU embeddings are identical in structure.}
+% Both have strictly one-dimensional embeddings (PC2$=0.00$), unlike what a richer
+% gradient-informed backbone might produce. The gradient channel in SGNN+GU enters
+% only through $U_\theta$ at decoding time, not through the GNN backbone, so the
+% backbone representations are structurally the same. The difference between SGNN+U
+% and SGNN+GU lies in whether $U_\theta$ receives the live gradient, and this
+% difference determines whether PR can train UPR to succeed rather than collapse.
+
+\section{Discussion}
+\label{sec:discussion}
+
+The experiments point to a distinction that is easy to obscure when evaluating
+learned combinatorial decoders: learning a good initial ranking is not the same
+as learning a ranking that remains valid under residual updates. In our setting,
+the GNN backbone reliably learns a degree-like ordering, and rerunning the GNN
+after each deletion recovers strong Easy and Medium performance. Yet this does
+not by itself yield an efficient decoder. The difficulty is not that the initial
+score is uninformative; it is that the score is not intrinsically compatible with
+the residual operation applied by the decoder.
+
+This explains why the updater ablations are decisive. Without the gradient
+channel, PR training gives the updater the right target sequence but not the
+right state variable. The model is asked to imitate a rerun-based decoder from
+a nonlinear score whose residual change is not algebraically available. This
+is why SGNN+U fails under UPR even when trained with PR. In contrast, SGNN+GU
+exposes a live gradient-derived coordinate whose deletion effect is local and
+maintainable. PR training then has a usable object to learn from: it does not
+need to invent the residual correction from a static nonlinear score, but only
+to learn how to use the maintained gradient signal to match the rerun decisions.
+
+The results also clarify the role of cached maintenance. The cache is not merely
+an implementation trick for speeding up the same computation. It changes what
+information is available to the decoder throughout the pruning trajectory. A
+stale gradient loses alignment because it ignores the vertices already removed;
+a deletion-updated cache preserves the dominant residual change at $O(n)$ cost
+per step. Thus the $O(n^2)$ decoder is not obtained by approximating an
+$O(n^3)$ rerun more cheaply at each step, but by maintaining the right residual
+quantity incrementally.
+
+% ============================================================
+% KNOWN-k ASSUMPTION:
+% Experiments use the planted clique size k as the stopping target.
+% If k is unknown, wrap decoding in binary search over k; O(log n) runs.
+% ============================================================
+\paragraph{Known target size.}
+Our experiments assume that the target clique size $k$ is known, as in the
+planted-clique setup. The decoder therefore knows when to stop pruning. If $k$ is
+not known, the same procedure can be wrapped in a binary search over candidate
+target sizes, with the returned set checked for clique validity. This requires
+$O(\log n)$ decoder calls, so an $O(n^2)$ UPR decoder becomes
+$O(n^2\log n)$ rather than $O(n^2)$.
+
+A useful consequence is that the successful updater need not preserve raw degree
+alignment. The representation diagnostics show that the GNN score itself is
+degree-aligned, while the post-update scores are only moderately correlated with
+degree. This is consistent with the purpose of UPR: after deletion begins, the
+decoder should track residual removal information, not simply reproduce the
+initial degree ordering. The gradient channel supplies information beyond this
+static ranking, which explains why SGNN+GU+PR can recover Easy and Medium
+instances even when the updated score is no longer a pure degree proxy. This also
+leaves an open interpretability question: if the successful updater is not simply
+following degree, what concept has it learned to use for each residual deletion
+decision? Our diagnostics identify the gradient channel as necessary, but they do
+not fully characterize the internal rule learned by $U_\theta$.
+
+More broadly, the paper suggests that neural decoders should be judged not only
+by score quality but by update compatibility. Classical residual algorithms are
+efficient because their maintained statistics have explicit local update rules.
+Our results show that a learned decoder can recover this property by exposing
+and maintaining a gradient coordinate. The problem-specific part is the form of
+the objective gradient and its cached sufficient statistics; the algorithmic
+principle is to align the learned decoder with the residual algebra of the
+objective.
+
+\paragraph{Limitations and future work.}
+The theory shows that gradient injection makes additive residual coordinates
+representable, but it does not guarantee that SGD will discover and use such
+coordinates consistently. GU addresses this by keeping the gradient-derived
+signal explicit during decoding. A stronger solution would be an architecture
+or loss that makes the GNN itself learn update-compatible coordinates, ideally
+removing the need for a separate updater. Another limitation is that GU assumes
+the objective and its derivative are known in advance, so the required cached
+statistics can be derived before decoding. Extending this idea to settings where
+the relevant loss or gradient is unknown, learned, or only available as a
+black-box signal remains open. Our training procedure also relies on PR
+supervision from a rerun-based teacher, which is expensive even though inference
+is quadratic. Reducing this training cost is an important practical direction.
+Finally, the experiments focus on planted clique. Extending the same
+gradient-maintenance principle to other locally decomposable objectives, such
+as independent set, cut, and constraint-satisfaction relaxations, remains an
+important test of the generality of the approach. In particular, it remains open
+how to obtain an analogous $O(n^2)$ learned residual decoder for
+\textsc{Max-Cut}, where the residual decision structure differs from clique
+peeling.
+
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+% ============================================================
+\appendix
+\section{Gradient Rectification}
+\label{app:rectification}
+% ============================================================
+
+\begin{theorem}[Gradient in $U_\theta$ enables exact additive updates]
+  \label{thm:rectification}
+  Let $\mathcal{L}(p) = \sum_r\alpha_r p^\top M_r p$ and
+  $g_i = \partial\mathcal{L}/\partial p_i$. The correct residual correction after
+  deleting $v^*$ is $\Delta g_i = -2\sum_r\alpha_r(M_r)_{iv^*}p_{v^*}$. Then:
+  \begin{enumerate}
+    \item \textbf{With $g_i$ in $U_\theta$:} $\Delta g_i$ is linear in
+      $(A_{iv^*}, p_{v^*})$, inputs already available to $U_\theta$. The first linear
+      layer of $U_\theta$ can represent $\Delta g_i$ exactly before any nonlinearity
+      fires.
+    \item \textbf{Without $g_i$ in $U_\theta$:} $U_\theta$ receives
+      $s_{v^*}=\sigma(z_{v^*})$, a nonlinear encoding. Recovering $\Delta g_i$
+      requires inverting $\sigma$, which by Theorem~\ref{thm:nonlinear} no fixed
+      additive rule can achieve. Errors accumulate and compound by
+      Theorem~\ref{thm:propagation}.
+  \end{enumerate}
+\end{theorem}
+\begin{proof}
+  \textbf{Part 1.} The correction $\Delta g_i = -2\sum_r\alpha_r(M_r)_{iv^*}p_{v^*}$
+  is linear in $(A_{iv^*}, p_{v^*})$. The first layer of $U_\theta$ computes
+  $W[s_i, s_{v^*}, A_{iv^*}, g_i, g_{v^*}]$, a linear map that can select the
+  appropriate combination of $g_{v^*}$ and $A_{iv^*}$ to represent $\Delta g_i$
+  exactly before any activation is applied.
+
+  \textbf{Part 2.} Without $g_i$, recovering $\Delta g_i$ from $\sigma(z_{v^*})$
+  requires inverting $\sigma$. By Theorem~\ref{thm:affine}, the correct update
+  requires affine dependence on the underlying statistic $d_{v^*}$; by
+  Theorem~\ref{thm:nonlinear}, no fixed additive rule achieves this. Every step
+  incurs nonzero error, and Theorem~\ref{thm:propagation} guarantees these errors
+  compound into trajectory divergence.
+\end{proof}
+
+\begin{remark}
+  Injecting the gradient into the GNN backbone rather than into $U_\theta$ does not
+  help: the backbone gradient is fixed at the end of the initial forward pass and goes
+  stale after the first deletion. $U_\theta$ requires the \emph{current} gradient,
+  which is supplied by the cached sufficient statistics updated in $O(n)$ at each step.
+  This is why SGNN+GU outperforms MAGNN+U empirically.
+\end{remark}
+
+
+
+
+
+
+
+
+
+
+
+\appendix
+
+% ============================================================
+\section{Full Proofs}
+\label{app:proofs}
+% ============================================================
+
+We give complete proofs of all results stated in Section~\ref{sec:theory}, following
+the structure of the proof document that accompanies this paper.
+
+\subsection*{Act I: The algebraic obstruction}
+
+\begin{theorem}[Theorem~\ref{thm:affine} restated]
+  Let $\mathcal{X}$ be a state space and $\varphi:\mathcal{X}\to\mathbb{R}^p$ a
+  score encoding. Suppose that for every elementary residual transformation
+  $T_\alpha$ there exists a fixed vector $c_\alpha\in\mathbb{R}^p$ such that
+  $\varphi(T_\alpha x)=\varphi(x)+c_\alpha$ for all admissible states $x$. Then,
+  for every state obtained from a reference state $x_0$ by a sequence
+  $T_{\alpha_r}\cdots T_{\alpha_1}$,
+  \[
+    \varphi(T_{\alpha_r}\cdots T_{\alpha_1}x_0)
+    =
+    \varphi(x_0)+\sum_{q=1}^r c_{\alpha_q}.
+  \]
+  In particular, if the residual state is represented by coordinates
+  $d\in\mathbb{Z}^m$ and elementary transformations induce fixed increments
+  $\Delta_\alpha$, then $\varphi$ is affine on the generated lattice:
+  $\varphi(d)=Cd+b$.
+\end{theorem}
+\begin{proof}
+  The first identity follows by repeated substitution of the assumed update rule:
+  \begin{align*}
+    \varphi(T_{\alpha_r}\cdots T_{\alpha_1}x_0)
+    &= \varphi(T_{\alpha_{r-1}}\cdots T_{\alpha_1}x_0) + c_{\alpha_r} \\
+    &= \cdots = \varphi(x_0) + \sum_{q=1}^r c_{\alpha_q}.
+  \end{align*}
+  In coordinate form, the relation $\varphi(d+\Delta_\alpha)-\varphi(d)=c_\alpha$
+  says that all discrete first differences of $\varphi$ along the generated
+  directions are constant. Hence $\varphi$ is affine on each connected lattice
+  component generated by these directions, giving $\varphi(d) = Cd + b$ for
+  $b = \varphi(0)$.
+\end{proof}
+
+\begin{theorem}[Theorem~\ref{thm:nonlinear} restated]
+  Let $f_\theta\colon\mathcal{G}\to\mathbb{R}^n$ be an MPNN with learned parameters
+  $\theta$, whose update MLPs contain at least one nonlinear activation $\sigma$.
+  Then for any fixed $c$, there exist $G$ and adjacent $u,v$ such that
+  $f_\theta(G)_v - c \neq f_\theta(G\setminus\{u\})_v$ regardless of $\theta$.
+\end{theorem}
+\begin{proof}
+  By Theorem~\ref{thm:affine}, exact updates require $f_\theta(G)_v$ to be affine
+  in $d_v$. But $f_\theta(G)_v$ is a composition of $\sigma$ with linear functions
+  of the neighborhood aggregation. Since $\sigma$ is nonlinear,
+  $\sigma(a - b) \neq \sigma(a) - \sigma(b)$ in general: the score after a deletion
+  is not the score before minus a fixed constant. No choice of $\theta$ can
+  eliminate this gap, because it is a consequence of the nonlinearity of $\sigma$
+  itself, not of the parameter values.
+\end{proof}
+
+\begin{theorem}[Theorem~\ref{thm:approx_flip} restated]
+  Let $\hat{s}_i^{(n)} = s_i^{(n)} + \varepsilon_i^{(n)}$ and let $\gamma_n :=
+  \min_{i\neq j}|s_i^{(n)} - s_j^{(n)}|$ be the minimum nonzero score gap. If
+  each removal step introduces a fixed nonzero error $\varepsilon > 0$, then after
+  $r = \lceil \gamma_n / \varepsilon \rceil$ steps the accumulated error crosses
+  $\gamma_n$ and a pairwise ordering is inverted.
+\end{theorem}
+\begin{proof}
+  Each removal adds $\varepsilon$ to the cumulative score error. After $r$ steps
+  the total error is $r\varepsilon$. Once $r\varepsilon > \gamma_n$, the error
+  exceeds the closest score gap and the wrong vertex is removed. Since $\varepsilon
+  > 0$ is fixed and the trajectory length grows with $n$, this crossing is
+  inevitable for any instance large enough.
+\end{proof}
+
+\begin{corollary}[Corollary~\ref{cor:vanishing_margin} restated]
+  For any nonlinear GNN score with irreducible per-step approximation error,
+  the accumulated error will eventually exceed the minimum score gap $\gamma_n$,
+  inverting the removal ordering. Exact additive coordinates are the only
+  structural remedy: they update the score algebraically and incur no approximation
+  error per step.
+\end{corollary}
+\begin{proof}
+  Immediate from Theorem~\ref{thm:approx_flip}: with fixed $\varepsilon > 0$ and
+  trajectory length growing with $n$, the accumulated error $r\varepsilon$
+  eventually exceeds $\gamma_n$ for any instance large enough.
+\end{proof}
+
+\begin{theorem}[Theorem~\ref{thm:propagation} restated]
+  Consider an iterative decoder that selects the element with minimum score. If at
+  some step approximate scores invert the ordering of two candidate elements, then
+  the approximate and exact decoders delete different elements and subsequently
+  evolve on different residual states. Later score discrepancies are governed by
+  structural divergence of the states, not by the original local approximation
+  error.
+\end{theorem}
+\begin{proof}
+  Once the ordering is inverted, the two decoders choose different elements. The
+  residual states after the deletion are consequently distinct: one contains vertex
+  $i$ and not $j$; the other contains $j$ and not $i$. Every later score is
+  evaluated on a different residual structure, so the next discrepancy is a
+  difference between two scoring problems on different graphs, not a perturbation of
+  the same score vector. Such discrepancies can compound arbitrarily across the
+  trajectory.
+\end{proof}
+
+\subsection*{Act II: The gradient as an additive coordinate}
+
+\begin{lemma}[Lemma~\ref{lem:local_gradient_correction} restated]
+  Let $\mathcal{L}(p;G) = \sum_i \phi_i(p_i) + \sum_{(i,j)\in
+  F(G)}\psi_{ij}(p_i,p_j,A_{ij})$ be a locally decomposable objective and
+  $g_i(G) = \partial\mathcal{L}/\partial p_i$. After deleting vertex $v$,
+  \[
+    g_i(G\setminus\{v\}) - g_i(G)
+    =
+    -\frac{\partial \psi_{iv}(p_i,p_v,A_{iv})}{\partial p_i},
+  \]
+  with the right-hand side zero when $(i,v)\notin F(G)$.
+\end{lemma}
+\begin{proof}
+  Differentiating the decomposed objective,
+  \[
+    g_i(G) = \phi_i'(p_i)
+    + \sum_{j:(i,j)\in F(G)} \frac{\partial \psi_{ij}(p_i,p_j,A_{ij})}{\partial p_i}.
+  \]
+  Deleting $v$ removes exactly the factor $\psi_{iv}$ from this sum and leaves all
+  other local factors involving $i$ unchanged. The stated correction follows
+  immediately.
+\end{proof}
+
+\begin{theorem}[Theorem~\ref{thm:gu_positive} restated]
+  For quadratic objectives $\mathcal{L}=\sum_r\alpha_r p^\top M_r p$, the deletion
+  correction is
+  \[
+    \Delta g_i(v) = -2\sum_r\alpha_r(M_r)_{iv}\,p_v.
+  \]
+  This is a linear function of $(A_{iv}, p_v)$. An updater $U_\theta$ receiving
+  gradient information can represent $\Delta g_i$ exactly in its first linear layer,
+  before any nonlinear activation fires.
+\end{theorem}
+\begin{proof}
+  For a quadratic term $p^\top M_r p$, the $i$-th gradient coordinate is
+  $\nabla_i(p^\top M_r p) = 2(M_r p)_i$. Removing $v$ eliminates the $v$-th
+  contribution from this marginal, giving
+  \[
+    \Delta g_i(v) = -2\sum_r \alpha_r (M_r)_{iv} p_v.
+  \]
+  This is linear in $(A_{iv}, p_v)$, both available as inputs to $U_\theta$. The
+  first affine layer of $U_\theta$ computes $W[s_i, s_{v^*}, A_{iv^*}, g_i,
+  g_{v^*}]$, a linear map that can set appropriate weights on $(A_{iv}, p_v)$ to
+  represent $\Delta g_i$ exactly before any activation is applied.
+
+  Without $g_i$, $U_\theta$ receives $s_{v^*} = \sigma(z_{v^*})$, a nonlinear
+  encoding. Recovering $\Delta g_i$ from $\sigma(z_{v^*})$ requires inverting
+  $\sigma$. By Theorem~\ref{thm:affine}, the correct update requires affine
+  dependence on the underlying statistic; by Theorem~\ref{thm:nonlinear}, no fixed
+  additive rule achieves this inversion. Every step therefore incurs nonzero error,
+  and Theorem~\ref{thm:propagation} guarantees these errors compound into
+  trajectory divergence.
+\end{proof}
+
+\subsection*{Act III: Cached maintenance}
+
+\begin{theorem}[Theorem~\ref{thm:cached_gradient_complexity} restated]
+  On a dense graph, suppose one GNN forward pass costs $O(n^2)$. The initial
+  gradient cache $(\mathbf{A}p, \mathbf{B}p, \sum_i p_i)$ can be built in $O(n^2)$
+  by two matrix-vector products. If each deletion updates this cache by subtracting
+  the deleted vertex's column contribution, then each residual step costs $O(n)$
+  and the full decoding trajectory costs $O(n^2)$.
+\end{theorem}
+\begin{proof}
+  The initial forward pass and the initial products $\mathbf{A}p$ and $\mathbf{B}p$
+  each cost $O(n^2)$. At a deletion step, updating $\mathbf{A}p$ and $\mathbf{B}p$
+  requires subtracting two length-$n$ vectors $\mathbf{A}_{:v}p_v$ and
+  $\mathbf{B}_{:v}p_v$, and updating $S$ requires one scalar subtraction, costing
+  $O(n)$ total. Since there are at most $n$ deletions, the total update cost is
+  $O(n^2)$, matching the initial setup. Hence the full decoding trajectory costs
+  $O(n^2)$.
+\end{proof}
+
+\begin{remark}
+  The cache maintains the gradient induced by deleting vertices from the current
+  residual objective under the cached probability values. If the learned updater
+  also changes all probabilities after each deletion, recomputing the exact fresh
+  gradient of those changed probabilities would require a dense matrix-vector
+  product. The cached gradient should therefore be understood as a
+  deletion-updated residual signal used by $U_\theta$, not as a full recomputation
+  after arbitrary global score drift.
+\end{remark}
+
+
+
+\end{document}

@@ -1,0 +1,82 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{lmodern}
+\usepackage[T1]{fontenc}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{parskip}
+
+\begin{document}
+
+\begin{flushright}
+  \today
+\end{flushright}
+
+\vspace{1em}
+
+\noindent
+Editors of \textit{Mathematics}
+
+\vspace{1em}
+
+\noindent
+Dear Editors,
+
+We are pleased to submit our manuscript, entitled
+\textit{``The Missing Signal: Gradient Injection Recovers $O(n^2)$ Residual
+Decoding in GNNs,''} for consideration as an Article in \textit{Mathematics}.
+
+The manuscript studies a concrete limitation of neural decoders for combinatorial
+optimization. Classical residual algorithms are efficient because they maintain
+statistics, such as degree, that can be updated locally after each deletion.
+GNN-based scores, however, pass through nonlinear transformations and generally do
+not admit such local additive updates. Consequently, a learned residual decoder may
+need to rerun the full GNN after every deletion, increasing the decoding cost from
+$O(n^2)$ to $O(n^3)$.
+
+Our contribution is to identify this update-compatibility issue and show that, for
+planted-clique recovery, the probability-space gradient of an unsupervised clique
+objective provides a valid residual coordinate. The key point is not simply that
+gradients are useful auxiliary features, but that this gradient has an exact local
+update rule under vertex deletion. Its coordinates can therefore be maintained in
+$O(n)$ time per deletion, allowing the decoder to run the GNN once and then update a
+cached residual state throughout the pruning process.
+
+Empirically, the resulting SGNN+GU decoder with Self-Imitation Training matches the
+rerun-based $O(n^3)$ decoder on Easy and Medium planted-clique regimes while
+retaining $O(n^2)$ decoding complexity.
+
+We believe the manuscript is suitable for \textit{Mathematics} because it connects
+graph algorithms, combinatorial optimization, planted-clique recovery, and the
+mathematical analysis of neural algorithmic reasoning. The central question is not
+only whether a GNN can learn a useful score, but whether the quantities used by a
+learned decoder have valid residual dynamics that support efficient algorithmic
+updates.
+
+We confirm that neither the manuscript nor any part of its content is currently
+under consideration for publication in another journal, and that the manuscript has
+not been previously published. All authors have approved the manuscript and agree
+with its submission to \textit{Mathematics}.
+
+\vspace{2em}
+
+\noindent
+Sincerely,
+
+\vspace{1.5em}
+
+\noindent
+Elad Shoham\\
+Department of Software and Information Systems Engineering\\
+Ben-Gurion University of the Negev\\
+Beer-Sheva 8410501, Israel\\
+\texttt{shellad@post.bgu.ac.il}
+
+\vspace{1em}
+
+\noindent
+On behalf of all authors:\\
+Elad Shoham, Havana Rika, and Dan Vilenchik
+
+\end{document}
