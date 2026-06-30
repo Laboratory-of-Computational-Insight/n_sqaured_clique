@@ -921,8 +921,8 @@ def write_upr_panels_html(
                 col=col,
             )
 
-        fig.update_xaxes(title_text="removal score (argmin)", row=1, col=col, **_axis_font_kwargs())
-        fig.update_yaxes(title_text="residual degree", row=1, col=col, **_axis_font_kwargs())
+        fig.update_xaxes(title_text="Score", row=1, col=col, **_axis_font_kwargs())
+        fig.update_yaxes(title_text="Degree", row=1, col=col, **_axis_font_kwargs())
 
     same_note = ", ".join(
         f"s{s}:argmin={'same' if snapshots[s]['same_argmin'] else 'diff'}, "
@@ -1043,6 +1043,8 @@ def write_pc1_pc2_pdf(data: dict, *, out_stem: Path) -> None:
     pc1 = np.asarray(data["pc1"], dtype=np.float64)
     pc2 = np.asarray(data["pc2"], dtype=np.float64)
     degree = np.asarray(data["degree"], dtype=np.float64)
+    pc1_var_pct = 100.0 * float(data.get("pc1_var", 0.0))
+    pc2_var_pct = 100.0 * float(data.get("pc2_var", 0.0))
 
     fig, ax = plt.subplots(figsize=FIG_SINGLE_SIZE, constrained_layout=True)
     norm = mcolors.Normalize(vmin=float(degree.min()), vmax=float(degree.max()))
@@ -1077,8 +1079,8 @@ def write_pc1_pc2_pdf(data: dict, *, out_stem: Path) -> None:
     cbar.set_ticks([])
     cbar.outline.set_linewidth(1.6)
 
-    ax.set_xlabel("PC1", fontsize=FONT_LABEL)
-    ax.set_ylabel("PC2", fontsize=FONT_LABEL)
+    ax.set_xlabel(f"PC1 ({pc1_var_pct:.1f}%)", fontsize=FONT_LABEL)
+    ax.set_ylabel(f"PC2 ({pc2_var_pct:.1f}%)", fontsize=FONT_LABEL)
     ax.tick_params(
         axis="both",
         which="both",
@@ -1182,8 +1184,8 @@ def write_upr_step_pdf(
         zorder=4,
     )
 
-    ax.set_xlabel("Removal score", fontsize=FONT_LABEL)
-    ax.set_ylabel("Residual degree", fontsize=FONT_LABEL)
+    ax.set_xlabel("Score", fontsize=FONT_LABEL)
+    ax.set_ylabel("Degree", fontsize=FONT_LABEL)
     ax.grid(True, linestyle="-", alpha=0.2)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)

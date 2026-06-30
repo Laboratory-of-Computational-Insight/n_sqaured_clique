@@ -56,6 +56,14 @@ SNAP_DATASETS = (
 
 SNAP_SPECS = (
     TrainSpec(
+        name="SGNN__objective_train",
+        architecture="SGNN",
+        updater_type="none",
+        use_gradient_in_updater=False,
+        neighbor_gate_updater=False,
+        training_way="objective",
+    ),
+    TrainSpec(
         name="SGNN_U__self_predictor_lpr_train",
         architecture="SGNN+U",
         updater_type="U",
@@ -67,6 +75,46 @@ SNAP_SPECS = (
         name="SGNN_GU__self_predictor_lpr_train",
         architecture="SGNN+GU",
         updater_type="GU",
+        use_gradient_in_updater=True,
+        neighbor_gate_updater=True,
+        training_way="self_predictor_lpr",
+    ),
+    TrainSpec(
+        name="SGNN_GU_BA__ba_self_predictor_lpr_train",
+        architecture="SGNN+GU-BA",
+        updater_type="GU",
+        use_gradient_in_updater=True,
+        neighbor_gate_updater=True,
+        training_way="ba_self_predictor_lpr",
+    ),
+    TrainSpec(
+        name="SGNN_GUL__self_predictor_lpr_train",
+        architecture="SGNN+GUL",
+        updater_type="GUL",
+        use_gradient_in_updater=True,
+        neighbor_gate_updater=True,
+        training_way="self_predictor_lpr",
+    ),
+    TrainSpec(
+        name="SGNN_GUC__self_predictor_lpr_train",
+        architecture="SGNN+GUC",
+        updater_type="GUC",
+        use_gradient_in_updater=True,
+        neighbor_gate_updater=True,
+        training_way="self_predictor_lpr",
+    ),
+    TrainSpec(
+        name="SGNN_FGU__self_predictor_lpr_train",
+        architecture="SGNN+FGU",
+        updater_type="FGU",
+        use_gradient_in_updater=True,
+        neighbor_gate_updater=True,
+        training_way="self_predictor_lpr",
+    ),
+    TrainSpec(
+        name="SGNN_DGU__self_predictor_lpr_train",
+        architecture="SGNN+DGU",
+        updater_type="DGU",
         use_gradient_in_updater=True,
         neighbor_gate_updater=True,
         training_way="self_predictor_lpr",
@@ -125,6 +173,17 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _ldr_row_metadata() -> dict:
+    return {
+        "model": "LDR",
+        "architecture": "LDR",
+        "updater_type": "none",
+        "use_gradient_in_updater": False,
+        "neighbor_gate_updater": False,
+        "training_way": "none",
+    }
 
 
 @torch.no_grad()
@@ -189,6 +248,58 @@ def _evaluate_snap(
     return rows
 
 
+@torch.no_grad()
+def _evaluate_snap_ldr(
+    device: torch.device,
+    *,
+    datasets: tuple[str, ...],
+) -> list[dict]:
+    rows: list[dict] = []
+    for dataset_name in datasets:
+        dataset_path = Path("datasets") / f"{dataset_name}.jsonl"
+        if not dataset_path.exists():
+            print(f"SKIP {dataset_name} (LDR): missing {dataset_path}", flush=True)
+            continue
+
+        cache = _load_snap_gt_cache(dataset_name)
+        with dataset_path.open() as f:
+            lines = f.readlines()
+
+        print(f"\n=== LDR on {dataset_name} ({len(lines)} graphs) ===", flush=True)
+
+        for graph_idx, line in enumerate(tqdm(lines, desc=f"ldr:{dataset_name}", unit="graph")):
+            rec = cache[graph_idx]
+            row = json.loads(line)
+            adj = np.array(row["adjacency_matrix"], dtype=np.float32)
+            n = adj.shape[0]
+
+            A = torch.tensor(adj, dtype=torch.float32, device=device)
+            planted = _planted_from_snap_cache(rec, device)
+            max_k = int(rec["max_clique_size"])
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            metrics = train.eval_one_decoder(None, A, planted, "ldr")
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            metrics["seconds"] = time.perf_counter() - t0
+
+            rows.append({
+                **_ldr_row_metadata(),
+                "eval_split": "snap",
+                "regime": dataset_name,
+                "decoder": "ldr",
+                "graph_idx": graph_idx,
+                "n": n,
+                "gt_source": rec.get("source", "cache"),
+                "k_for_generation_and_eval_only": max_k,
+                **metrics,
+            })
+
+    return rows
+
+
 def _print_snap_summary(rows: list[dict]) -> None:
     agg = train.aggregate_rows(rows)
     print("\n=== SNAP approx (Table 6 style) ===", flush=True)
@@ -201,43 +312,79 @@ def _print_snap_summary(rows: list[dict]) -> None:
 
 
 def cmd_snap(args: argparse.Namespace) -> None:
-    train.apply_run_config(train_regime=args.train_regime)
+    train.apply_run_config(
+        train_regime=args.train_regime,
+        layers=getattr(args, "layers", None),
+        epochs=getattr(args, "epochs", None),
+    )
     train.SNAP_GT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     np.random.seed(train.SEED)
     torch.manual_seed(train.SEED)
     device = torch.device(train.DEVICE)
-    decoders = tuple(args.decoders)
+
+    # Separate LDR (no checkpoint) from model-based decoders
+    requested = tuple(args.decoders)
+    model_decoders = tuple(d for d in requested if d != "ldr")
+    run_ldr = "ldr" in requested
 
     use_both = "both" in args.models
     specs: list[TrainSpec] = []
-    if use_both or "u" in args.models:
+    if use_both or "sgnn" in args.models:
         specs.append(SNAP_SPECS[0])
-    if use_both or "gu" in args.models:
+    if use_both or "u" in args.models:
         specs.append(SNAP_SPECS[1])
+    if use_both or "gu" in args.models:
+        specs.append(SNAP_SPECS[2])
+    if use_both or "guba" in args.models:
+        specs.append(SNAP_SPECS[3])
+    if use_both or "gul" in args.models:
+        specs.append(SNAP_SPECS[4])
+    if use_both or "guc" in args.models:
+        specs.append(SNAP_SPECS[5])
+    if use_both or "fgu" in args.models:
+        specs.append(SNAP_SPECS[6])
+    if use_both or "dgu" in args.models:
+        specs.append(SNAP_SPECS[7])
 
     print(
-        f"snap: device={device} regime={args.train_regime} decoders={decoders} "
-        f"out={train.OUTPUT_DIR}",
+        f"snap: device={device} regime={args.train_regime} "
+        f"decoders={requested} out={train.OUTPUT_DIR}",
         flush=True,
     )
 
     t0 = time.perf_counter()
     all_rows: list[dict] = []
-    for spec in specs:
-        model = train.load_model_checkpoint(spec, device)
-        all_rows.extend(
-            _evaluate_snap(
-                model, spec, device,
-                datasets=tuple(args.datasets), decoders=decoders,
-            )
-        )
 
-    _write_csv(train.SNAP_PER_INSTANCE_CSV, all_rows)
-    _write_csv(train.SNAP_AGGREGATE_CSV, train.aggregate_rows(all_rows))
-    _print_snap_summary(all_rows)
+    # LDR needs no model
+    if run_ldr:
+        all_rows.extend(_evaluate_snap_ldr(device, datasets=tuple(args.datasets)))
+
+    # Model-based decoders — evaluate one dataset at a time, print+save after each
+    if model_decoders:
+        for spec in specs:
+            model = train.load_model_checkpoint(spec, device)
+            for dataset_name in args.datasets:
+                new_rows = _evaluate_snap(
+                    model, spec, device,
+                    datasets=(dataset_name,), decoders=model_decoders,
+                )
+                all_rows.extend(new_rows)
+                # Print aggregate for this dataset immediately
+                agg = train.aggregate_rows(new_rows)
+                for row in agg:
+                    print(
+                        f"[snap done: {dataset_name}] {row['model']:<40} {row['regime']:<14} "
+                        f"{row['decoder']:<14} approx={row['approx_mean']:.3f}±{row['approx_std']:.3f}"
+                        f"  n={row['num_instances']}",
+                        flush=True,
+                    )
+                # Incrementally save everything collected so far
+                _write_csv(train.SNAP_PER_INSTANCE_CSV, all_rows)
+                _write_csv(train.SNAP_AGGREGATE_CSV, train.aggregate_rows(all_rows))
+
     print(f"\nSaved {train.SNAP_PER_INSTANCE_CSV}", flush=True)
-    print(f"Saved {train.SNAP_AGGREGATE_CSV}", flush=True)
+    print(f"\nSaved {train.SNAP_AGGREGATE_CSV}", flush=True)
     print(f"Done in {time.perf_counter() - t0:.1f}s", flush=True)
 
 
@@ -1632,6 +1779,126 @@ def cmd_degree(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Connectivity diagnostic (does LDR pruning disconnect SNAP graphs?)
+# ---------------------------------------------------------------------------
+
+def _count_components_alive(A_np: np.ndarray, alive_np: np.ndarray) -> int:
+    """BFS count of connected components in the alive subgraph."""
+    idx = np.where(alive_np)[0].tolist()
+    if not idx:
+        return 0
+    visited: set[int] = set()
+    n_comp = 0
+    for start in idx:
+        if start in visited:
+            continue
+        n_comp += 1
+        queue = [start]
+        while queue:
+            node = queue.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            neighbours = np.where((A_np[node] > 0.5) & alive_np)[0].tolist()
+            queue.extend(n for n in neighbours if n not in visited)
+    return n_comp
+
+
+def _simulate_ldr_connectivity(A_np: np.ndarray) -> dict:
+    """
+    Simulate Least-Degree-Removal on A and record when the alive subgraph
+    first splits into more than one connected component.
+
+    Returns a dict with:
+        n                   — original graph size
+        n_edges             — original edge count
+        disconnects         — True if >1 component ever seen
+        first_disconnect_step — step index when it first splits (or None)
+        first_disconnect_alive — #alive vertices at first split (or None)
+        max_components      — maximum number of components seen
+    """
+    n = A_np.shape[0]
+    alive = np.ones(n, dtype=bool)
+    deg = A_np.sum(axis=1).astype(np.float64)
+    max_comp = 1
+    first_step = None
+    first_alive = None
+
+    for step in range(n - 1):
+        # Remove lowest-degree alive vertex (LDR)
+        masked_deg = np.where(alive, deg, np.inf)
+        v = int(np.argmin(masked_deg))
+        alive[v] = False
+        deg -= A_np[:, v]
+        deg[v] = 0.0
+
+        n_alive = int(alive.sum())
+        if n_alive < 2:
+            break
+
+        n_comp = _count_components_alive(A_np, alive)
+        if n_comp > max_comp:
+            max_comp = n_comp
+        if n_comp > 1 and first_step is None:
+            first_step = step + 1
+            first_alive = n_alive
+
+    return {
+        "n": n,
+        "n_edges": int(A_np.sum()) // 2,
+        "disconnects": first_step is not None,
+        "first_disconnect_step": first_step,
+        "first_disconnect_alive": first_alive,
+        "max_components": max_comp,
+    }
+
+
+def cmd_connectivity(args: argparse.Namespace) -> None:
+    """Simulate LDR pruning on each SNAP graph and report disconnection stats."""
+    print("Connectivity diagnostic: does LDR pruning disconnect SNAP graphs?")
+    print("=" * 70, flush=True)
+
+    for dataset_name in args.datasets:
+        dataset_path = Path("datasets") / f"{dataset_name}.jsonl"
+        if not dataset_path.exists():
+            print(f"SKIP {dataset_name}: {dataset_path} not found", flush=True)
+            continue
+
+        with dataset_path.open() as f:
+            lines = f.readlines()
+
+        print(f"\n--- {dataset_name} ({len(lines)} graphs) ---", flush=True)
+        n_disconnects = 0
+        first_steps: list[int] = []
+        first_alives: list[int] = []
+
+        for line in tqdm(lines, desc=dataset_name, unit="graph"):
+            row = json.loads(line)
+            adj = np.array(row["adjacency_matrix"], dtype=np.float32)
+            stats = _simulate_ldr_connectivity(adj)
+            if stats["disconnects"]:
+                n_disconnects += 1
+                if stats["first_disconnect_step"] is not None:
+                    first_steps.append(stats["first_disconnect_step"])
+                if stats["first_disconnect_alive"] is not None:
+                    first_alives.append(stats["first_disconnect_alive"])
+
+        total = len(lines)
+        print(f"  graphs with ≥1 component split: {n_disconnects}/{total}", flush=True)
+        if first_steps:
+            print(
+                f"  first-split step: mean={np.mean(first_steps):.1f}  "
+                f"min={min(first_steps)}  max={max(first_steps)}",
+                flush=True,
+            )
+            print(
+                f"  alive at first split: mean={np.mean(first_alives):.1f}  "
+                f"min={min(first_alives)}  max={max(first_alives)}",
+                flush=True,
+            )
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1658,6 +1925,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_regime_arg(snap)
     snap.add_argument(
+        "--layers",
+        type=int,
+        default=None,
+        help="Override GNN layers (e.g. 8 for L8 checkpoints). Default: 4.",
+    )
+    snap.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Override epochs suffix (e.g. 1200 for _E1200 checkpoints). Default: none.",
+    )
+    snap.add_argument(
         "--datasets",
         nargs="+",
         default=list(SNAP_DATASETS),
@@ -1667,14 +1946,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--decoders",
         nargs="+",
         default=("upr",),
-        help="Decoder names (Table 6: upr)",
+        help="Decoder names (ldr needs no checkpoint, others need model)",
     )
     snap.add_argument(
         "--models",
         nargs="+",
-        choices=("u", "gu", "both"),
+        choices=("sgnn", "u", "gu", "guba", "gul", "guc", "fgu", "dgu", "both"),
         default=("both",),
-        help="SIT checkpoints: SGNN+U, SGNN+GU, or both",
+        help="Checkpoints: SGNN, SGNN+U, SGNN+GU, or both (u+gu)",
     )
     snap.set_defaults(func=cmd_snap)
 
@@ -1706,6 +1985,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_regime_arg(degree)
     degree.set_defaults(func=cmd_degree)
+
+    connectivity = sub.add_parser(
+        "connectivity",
+        help="Check whether LDR pruning disconnects SNAP graphs (diagnostic)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    connectivity.add_argument(
+        "--datasets",
+        nargs="+",
+        default=list(SNAP_DATASETS),
+        help="SNAP stems under datasets/*.jsonl",
+    )
+    connectivity.set_defaults(func=cmd_connectivity)
 
     return parser
 
