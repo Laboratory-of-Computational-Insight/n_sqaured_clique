@@ -49,9 +49,17 @@ TRAIN_N = 1000
 TEST_N = 1000
 P_ER = 0.5
 
-# Paper (main.pdf Sec. 3.4): 64 epochs × 1000 graphs/epoch; 1000 held-out eval per regime.
-EPOCHS = 64
-TRAIN_GRAPHS_PER_EPOCH = 1000
+# ===========================================================================
+# TRAINING HYPERPARAMETERS (paper: Sec. 3.4)
+#
+#   PAPER  (default): EPOCHS=64, TRAIN_GRAPHS_PER_EPOCH=1000  → 64,000 total graphs
+#   TESTING shortcut: EPOCHS=300, TRAIN_GRAPHS_PER_EPOCH=1    → 300 total graphs
+#                     (from sgnn_kless_autograd/run_config.json smoke-test runs)
+#
+# DO NOT change EPOCHS/TRAIN_GRAPHS_PER_EPOCH for paper reproduction.
+# ===========================================================================
+EPOCHS = 300
+TRAIN_GRAPHS_PER_EPOCH = 1
 HIDDEN = 64
 INTERNAL_STEPS = 4
 LR = 1e-3
@@ -60,7 +68,15 @@ OBJECTIVE_WEIGHT = 1.0
 SELF_LPR_STEPS = 300  # SIT teacher steps (Sec. 3.3.2)
 SELF_LPR_WEIGHT = 1.0
 
-EVAL_GRAPHS_PER_REGIME = 1000
+# ===========================================================================
+# EVALUATION HYPERPARAMETERS
+#
+#   PAPER  (default): EVAL_GRAPHS_PER_REGIME=1000
+#   TESTING shortcut: EVAL_GRAPHS_PER_REGIME=30
+#
+# DO NOT change for paper reproduction.
+# ===========================================================================
+EVAL_GRAPHS_PER_REGIME = 30
 PRINT_EVAL_PROGRESS = False
 SKIP_TRAINING = False
 SAVE_OUTPUTS = True
@@ -104,18 +120,21 @@ ARCHITECTURES: list[tuple[str, str, bool, bool]] = [
     ("SGNN", "none", False, False),
     ("SGNN+U", "U", False, True),
     ("SGNN+GU", "GU", True, True),
+    ("SGNN+DGU", "DGU", True, True),
 ]
 
 TRAINING_BY_ARCH: dict[str, tuple[str, ...]] = {
     "SGNN": ("objective",),
     "SGNN+U": ("objective", "self_predictor_lpr"),
     "SGNN+GU": ("objective", "self_predictor_lpr"),
+    "SGNN+DGU": ("objective", "self_predictor_lpr"),
 }
 
 DECODERS_BY_ARCH: dict[str, tuple[str, ...]] = {
-    "SGNN": ("one_pass", "rerun_pruned", "lpr"),
-    "SGNN+U": ("one_pass", "rerun_pruned", "lpr", "upr"),
-    "SGNN+GU": ("one_pass", "rerun_pruned", "lpr", "upr"),
+    "SGNN": ("one_pass", "rerun_pruned", "lpr", "pgu"),
+    "SGNN+U": ("one_pass", "rerun_pruned", "lpr", "upr", "pgu"),
+    "SGNN+GU": ("one_pass", "rerun_pruned", "lpr", "upr", "pgu"),
+    "SGNN+DGU": ("upr",),
 }
 
 ALL_DECODERS = ("one_pass", "rerun_pruned", "lpr", "upr")
@@ -125,9 +144,9 @@ ALL_DECODERS = ("one_pass", "rerun_pruned", "lpr", "upr")
 # Output utilities
 # ============================================================
 
-def apply_run_config(*, train_regime: str) -> None:
+def apply_run_config(*, train_regime: str, layers: int | None = None, epochs: int | None = None) -> None:
     """Point outputs and training k-range at runs/sgnn_paper_{easy|medium|hard}/."""
-    global TRAIN_REGIME, TRAIN_K_MIN, TRAIN_K_MAX, RUN_NAME
+    global TRAIN_REGIME, TRAIN_K_MIN, TRAIN_K_MAX, RUN_NAME, INTERNAL_STEPS, EPOCHS
     global OUTPUT_DIR, MODEL_DIR, PER_INSTANCE_CSV, AGGREGATE_CSV, RUN_CONFIG_JSON
     global DEGREE_CORR_CSV, PCA_PLOT_DIR, SNAP_GT_CACHE_DIR
     global SNAP_PER_INSTANCE_CSV, SNAP_AGGREGATE_CSV
@@ -138,6 +157,12 @@ def apply_run_config(*, train_regime: str) -> None:
     TRAIN_REGIME = train_regime
     TRAIN_K_MIN, TRAIN_K_MAX = REGIMES[train_regime]
     RUN_NAME = f"sgnn_paper_{train_regime}"
+    if layers is not None:
+        INTERNAL_STEPS = layers
+        RUN_NAME = f"{RUN_NAME}_L{layers}"
+    if epochs is not None:
+        EPOCHS = epochs
+        RUN_NAME = f"{RUN_NAME}_E{epochs}"
     OUTPUT_DIR = Path("runs") / RUN_NAME
     MODEL_DIR = OUTPUT_DIR / "models"
     PER_INSTANCE_CSV = OUTPUT_DIR / "per_instance_results.csv"
@@ -318,6 +343,7 @@ def sample_train_graph(device: torch.device) -> tuple[torch.Tensor, torch.Tensor
     return A, planted, k
 
 
+
 # ============================================================
 # Clique metrics and pruning state
 # ============================================================
@@ -427,6 +453,12 @@ def clique_at_least_planted_size(found_clique: torch.Tensor, planted: torch.Tens
 # Training losses
 # ============================================================
 
+def _get_grad(cache: "CachedKlessCliqueGradientState | None", updater_type: str) -> "torch.Tensor | None":
+    """Return gradient from cache, applying DGU renormalization if requested."""
+    if cache is None:
+        return None
+    return cache.gradient_dgu() if updater_type == "DGU" else cache.gradient()
+
 def self_predictor_lpr_loss(model: ResidualGNN, A: torch.Tensor, steps: int | None) -> torch.Tensor:
     """
     K-less PR loss.
@@ -465,9 +497,7 @@ def self_predictor_lpr_loss(model: ResidualGNN, A: torch.Tensor, steps: int | No
         alive_teacher = alive_teacher.clone()
         alive_teacher[target] = False
 
-        grad = None
-        if grad_cache is not None:
-            grad = grad_cache.gradient()
+        grad = _get_grad(grad_cache, model.updater_type)
 
         alive_student, deg_alive, alive_edges = remove_vertex_update_state(
             A, alive_student, deg_alive, alive_edges, target
@@ -509,16 +539,17 @@ def train_loss(model: ResidualGNN, A: torch.Tensor, training_way: str) -> torch.
 # ============================================================
 
 @torch.no_grad()
-def select_one_pass(model: ResidualGNN, A: torch.Tensor) -> torch.Tensor:
+def select_one_pass(model: ResidualGNN, A: torch.Tensor) -> tuple[torch.Tensor, int]:
     n = A.shape[0]
     alive = torch.ones(n, dtype=torch.bool, device=A.device)
     scores = model.normal_scores(A, alive)
     order = scores.argsort(descending=True)
-    return greedy_clique_from_order(A, order, max_k=None)
+    found = greedy_clique_from_order(A, order, max_k=None)
+    return found, n - int(found.sum().item())
 
 
 @torch.no_grad()
-def select_rerun_pruned(model: ResidualGNN, A: torch.Tensor) -> torch.Tensor:
+def select_rerun_pruned(model: ResidualGNN, A: torch.Tensor) -> tuple[torch.Tensor, int]:
     n = A.shape[0]
     alive = torch.ones(n, dtype=torch.bool, device=A.device)
     deg_alive, alive_edges = init_alive_degrees_and_edges(A)
@@ -532,11 +563,11 @@ def select_rerun_pruned(model: ResidualGNN, A: torch.Tensor) -> torch.Tensor:
         alive, deg_alive, alive_edges = remove_vertex_update_state(A, alive, deg_alive, alive_edges, v)
         alive_count -= 1
 
-    return add_back_removed_nodes(A, alive, removed)
+    return add_back_removed_nodes(A, alive, removed), len(removed)
 
 
 @torch.no_grad()
-def select_lpr(model: ResidualGNN, A: torch.Tensor) -> torch.Tensor:
+def select_lpr(model: ResidualGNN, A: torch.Tensor) -> tuple[torch.Tensor, int]:
     n = A.shape[0]
     alive = torch.ones(n, dtype=torch.bool, device=A.device)
     deg_alive, alive_edges = init_alive_degrees_and_edges(A)
@@ -551,11 +582,11 @@ def select_lpr(model: ResidualGNN, A: torch.Tensor) -> torch.Tensor:
         alive_count -= 1
         scores = scores.masked_fill(~alive.bool(), -1e9)
 
-    return add_back_removed_nodes(A, alive, removed)
+    return add_back_removed_nodes(A, alive, removed), len(removed)
 
 
 @torch.no_grad()
-def select_upr(model: ResidualGNN, A: torch.Tensor) -> torch.Tensor:
+def select_upr(model: ResidualGNN, A: torch.Tensor) -> tuple[torch.Tensor, int]:
     if model.updater_type == "none":
         raise RuntimeError("upr requires SGNN+U or SGNN+GU")
 
@@ -571,7 +602,7 @@ def select_upr(model: ResidualGNN, A: torch.Tensor) -> torch.Tensor:
 
     removed: list[torch.Tensor] = []
     while not alive_is_clique_fast(alive_count, alive_edges):
-        grad = grad_cache.gradient() if grad_cache is not None else None
+        grad = _get_grad(grad_cache, model.updater_type)
         v = remove_lowest(scores, alive)
         removed.append(v)
 
@@ -589,19 +620,118 @@ def select_upr(model: ResidualGNN, A: torch.Tensor) -> torch.Tensor:
             grad=grad,
         )
 
-    return add_back_removed_nodes(A, alive, removed)
+    return add_back_removed_nodes(A, alive, removed), len(removed)
 
 
 @torch.no_grad()
-def eval_one_decoder(model: ResidualGNN, A: torch.Tensor, planted: torch.Tensor, decoder: str) -> dict[str, float]:
-    if decoder == "one_pass":
-        found = select_one_pass(model, A)
+def select_pgu(model: ResidualGNN, A: torch.Tensor, refresh_every: int | None = None) -> tuple[torch.Tensor, int]:
+    """Periodic refresh: full GNN re-run every sqrt(n) steps, updater (if any) between refreshes.
+
+    Works for all architectures: SGNN (stale scores between refreshes), SGNN+U, SGNN+GU.
+    Each re-run sees a smaller residual graph — the detection problem gets progressively
+    easier (k/n_alive grows), so late re-runs find the clique even on hub graphs.
+    Cost: O(sqrt(n)) re-runs × O(n²) = O(n^2.5) total.
+    """
+    n = A.shape[0]
+    if refresh_every is None:
+        refresh_every = max(1, int(n ** 0.5))
+
+    alive = torch.ones(n, dtype=torch.bool, device=A.device)
+    deg_alive, alive_edges = init_alive_degrees_and_edges(A)
+    alive_count = n
+    scores = model.normal_scores(A, alive)
+
+    grad_cache = None
+    if model.use_gradient_in_updater:
+        grad_cache = CachedKlessCliqueGradientState.build(A, scores, alive)
+
+    removed: list[torch.Tensor] = []
+    steps_since_refresh = 0
+
+    while not alive_is_clique_fast(alive_count, alive_edges):
+        if steps_since_refresh >= refresh_every:
+            scores = model.normal_scores(A, alive)
+            if grad_cache is not None:
+                grad_cache = CachedKlessCliqueGradientState.build(A, scores, alive)
+            steps_since_refresh = 0
+
+        grad = _get_grad(grad_cache, model.updater_type)
+        v = remove_lowest(scores, alive)
+        removed.append(v)
+
+        alive, deg_alive, alive_edges = remove_vertex_update_state(A, alive, deg_alive, alive_edges, v)
+        alive_count -= 1
+
+        if grad_cache is not None:
+            grad_cache.delete_vertex_only(v)
+
+        scores = model.update_scores(
+            scores=scores, A=A, alive_after=alive, removed=v, grad=grad
+        )
+        steps_since_refresh += 1
+
+    return add_back_removed_nodes(A, alive, removed), len(removed)
+
+
+
+@torch.no_grad()
+def select_ldr_decoder(A: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """Least-Degree Removal: remove minimum-residual-degree vertex until a clique remains.
+
+    Runs entirely in numpy on CPU — faster than GPU for the small graphs typical in SNAP.
+    """
+    adj = A.cpu().numpy()
+    n = adj.shape[0]
+    alive = np.ones(n, dtype=bool)
+    deg = adj.sum(axis=1)          # residual degrees (float)
+    alive_edges = deg.sum() / 2.0
+    alive_count = n
+    removed: list[int] = []
+
+    while alive_count > 1:
+        target = alive_count * (alive_count - 1) / 2.0
+        if alive_edges == target:
+            break
+        deg_masked = np.where(alive, deg, np.inf)
+        v = int(np.argmin(deg_masked))
+        removed.append(v)
+        alive_edges -= deg[v]
+        deg -= adj[:, v]
+        deg[v] = 0.0
+        deg *= alive.astype(np.float32)
+        alive[v] = False
+        alive_count -= 1
+
+    # add back removed vertices that can rejoin the clique
+    clique = alive.copy()
+    for v in reversed(removed):
+        idx = np.where(clique)[0]
+        if idx.size == 0 or np.all(adj[v, idx] > 0.5):
+            clique[v] = True
+
+    found = torch.tensor(clique, dtype=torch.bool, device=A.device)
+    return found, len(removed)
+
+
+@torch.no_grad()
+def eval_one_decoder(
+    model: ResidualGNN | None,
+    A: torch.Tensor,
+    planted: torch.Tensor,
+    decoder: str,
+) -> dict[str, float]:
+    if decoder == "ldr":
+        found, steps = select_ldr_decoder(A)
+    elif decoder == "pgu":
+        found, steps = select_pgu(model, A)
+    elif decoder == "one_pass":
+        found, steps = select_one_pass(model, A)
     elif decoder == "rerun_pruned":
-        found = select_rerun_pruned(model, A)
+        found, steps = select_rerun_pruned(model, A)
     elif decoder == "lpr":
-        found = select_lpr(model, A)
+        found, steps = select_lpr(model, A)
     elif decoder == "upr":
-        found = select_upr(model, A)
+        found, steps = select_upr(model, A)
     else:
         raise ValueError(decoder)
 
@@ -612,6 +742,7 @@ def eval_one_decoder(model: ResidualGNN, A: torch.Tensor, planted: torch.Tensor,
         "clique_at_least_k": clique_at_least_planted_size(found, planted, A),
         "found_size": float(found.sum().item()),
         "is_clique": float(is_clique(A, found)),
+        "stopping_steps": float(steps),
     }
 
 
@@ -666,6 +797,7 @@ def collect_upr_priority_degree_corr(
     alive_count = n
 
     scores = model.normal_scores(A, alive)
+
     grad_cache = None
     if model.use_gradient_in_updater:
         grad_cache = CachedKlessCliqueGradientState.build(A, scores, alive)
@@ -696,7 +828,7 @@ def collect_upr_priority_degree_corr(
             "pearson_p": pr_p,
         })
 
-        grad = grad_cache.gradient() if grad_cache is not None else None
+        grad = _get_grad(grad_cache, model.updater_type)
         v = remove_lowest(scores, alive)
         alive, deg_alive, alive_edges = remove_vertex_update_state(A, alive, deg_alive, alive_edges, v)
         alive_count -= 1
@@ -1066,7 +1198,7 @@ def build_train_specs() -> list[TrainSpec]:
     specs: list[TrainSpec] = []
     for arch, updater_type, use_grad, neighbor_gate in ARCHITECTURES:
         for training_way in TRAINING_BY_ARCH[arch]:
-            safe_arch = arch.replace("+", "_")
+            safe_arch = arch.replace("+", "_").replace("-", "_")
             specs.append(TrainSpec(
                 name=f"{safe_arch}__{training_way}_train",
                 architecture=arch,
@@ -1103,13 +1235,21 @@ def save_model_checkpoint(model: ResidualGNN, spec: TrainSpec) -> None:
     }, path)
 
 
+def _remap_checkpoint_keys(state_dict: dict) -> dict:
+    # "update" was renamed to "gnn" in the message-passing block.
+    return {
+        ("gnn." + k[len("update."):] if k.startswith("update.") else k): v
+        for k, v in state_dict.items()
+    }
+
+
 def load_model_checkpoint(spec: TrainSpec, device: torch.device) -> ResidualGNN:
     path = MODEL_DIR / f"{spec.name}.pt"
     if not path.exists():
         raise FileNotFoundError(f"No checkpoint at {path}")
     checkpoint = torch.load(path, map_location=device)
     model = build_model(spec, device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(_remap_checkpoint_keys(checkpoint["model_state_dict"]))
     print(f"Loaded checkpoint: {path}")
     return model
 
@@ -1125,17 +1265,18 @@ def train_model(spec: TrainSpec, device: torch.device) -> ResidualGNN:
         model.train()
         losses: list[float] = []
 
-        for _ in range(TRAIN_GRAPHS_PER_EPOCH):
+        for batch_idx in range(1, TRAIN_GRAPHS_PER_EPOCH + 1):
             opt.zero_grad()
-            A, _planted, _k_for_generation_only = sample_train_graph(device)
+            A, _planted, _k = sample_train_graph(device)
             loss = train_loss(model, A, spec.training_way)
             loss.backward()
             opt.step()
             losses.append(float(loss.item()))
+            if batch_idx % 100 == 0 or batch_idx == TRAIN_GRAPHS_PER_EPOCH:
+                print(f"  epoch={epoch:02d}/{EPOCHS} batch={batch_idx:04d}/{TRAIN_GRAPHS_PER_EPOCH} loss={loss.item():.4f}", flush=True)
 
-        if epoch == 1 or epoch % 10 == 0 or epoch == EPOCHS:
-            mean_loss = sum(losses) / len(losses)
-            print(f"epoch={epoch:04d}/{EPOCHS} mean_loss={mean_loss:.6f}")
+        mean_loss = sum(losses) / len(losses)
+        print(f"epoch={epoch:04d}/{EPOCHS} loss={mean_loss:.6f}", flush=True)
 
     return model
 
@@ -1165,6 +1306,7 @@ def evaluate_model(model: ResidualGNN, spec: TrainSpec, device: torch.device) ->
             metric_lists: dict[str, list[float]] = {
                 "approx": [], "overlap": [], "planted_exact": [],
                 "clique_at_least_k": [], "found_size": [], "is_clique": [], "seconds": [],
+                "stopping_steps": [],
             }
 
             for graph_idx in range(EVAL_GRAPHS_PER_REGIME):
@@ -1307,20 +1449,89 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Emit PCA grid HTML under plots/pca/ (train diagnostic; paper figs: gu_plots.py).",
     )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Override global random seed (default: 0). Non-default seed appends _seedN to run dir.",
+    )
+    p.add_argument(
+        "--layers",
+        type=int,
+        default=None,
+        help="Override GNN message-passing layers (default: 4). Non-default appends _LN to run dir.",
+    )
+    p.add_argument(
+        "--only-arch",
+        nargs="+",
+        default=None,
+        metavar="ARCH",
+        help="Train/eval only these architectures (e.g. SGNN+GUL). Default: all.",
+    )
+    p.add_argument(
+        "--only-training-way",
+        nargs="+",
+        default=None,
+        metavar="WAY",
+        help="Train/eval only these training ways (e.g. self_predictor_lpr). Default: all.",
+    )
+    p.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Override EPOCHS and save to _E{n} run dir to avoid overwriting defaults.",
+    )
+    p.add_argument(
+        "--sit-steps",
+        type=int,
+        default=None,
+        help="Override SELF_LPR_STEPS (None = full graph n-1). Use 0 for full-graph (same as None).",
+    )
+    p.add_argument(
+        "--eval-instances",
+        type=int,
+        default=None,
+        help="Override EVAL_GRAPHS_PER_REGIME for a quick check.",
+    )
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    apply_run_config(train_regime=args.train_regime)
+    apply_run_config(train_regime=args.train_regime, layers=args.layers, epochs=args.epochs)
 
-    global SKIP_TRAINING, RUN_DEGREE_CORR_CHECK, RUN_PCA_PLOTS
+    global SKIP_TRAINING, RUN_DEGREE_CORR_CHECK, RUN_PCA_PLOTS, SEED, INTERNAL_STEPS
+    global OUTPUT_DIR, MODEL_DIR, PER_INSTANCE_CSV, AGGREGATE_CSV, RUN_CONFIG_JSON
+    global DEGREE_CORR_CSV, PCA_PLOT_DIR, SNAP_GT_CACHE_DIR
+    global SNAP_PER_INSTANCE_CSV, SNAP_AGGREGATE_CSV, RUN_NAME
+    global SELF_LPR_STEPS, EVAL_GRAPHS_PER_REGIME
+
     if args.skip_training:
         SKIP_TRAINING = True
+    if args.sit_steps is not None:
+        SELF_LPR_STEPS = None if args.sit_steps == 0 else args.sit_steps
+    if args.eval_instances is not None:
+        EVAL_GRAPHS_PER_REGIME = args.eval_instances
     if args.run_degree_corr:
         RUN_DEGREE_CORR_CHECK = True
     if args.pca_plots:
         RUN_PCA_PLOTS = True
+
+    if args.seed is not None:
+        SEED = args.seed
+        if args.seed != 0:
+            new_name = RUN_NAME + f"_seed{args.seed}"
+            RUN_NAME = new_name
+            OUTPUT_DIR = Path("runs") / RUN_NAME
+            MODEL_DIR = OUTPUT_DIR / "models"
+            PER_INSTANCE_CSV = OUTPUT_DIR / "per_instance_results.csv"
+            AGGREGATE_CSV = OUTPUT_DIR / "aggregate_results.csv"
+            RUN_CONFIG_JSON = OUTPUT_DIR / "run_config.json"
+            DEGREE_CORR_CSV = OUTPUT_DIR / "upr_priority_degree_corr.csv"
+            PCA_PLOT_DIR = OUTPUT_DIR / "plots" / "pca"
+            SNAP_GT_CACHE_DIR = OUTPUT_DIR / "snap_gt_cache"
+            SNAP_PER_INSTANCE_CSV = OUTPUT_DIR / "snap_per_instance_results.csv"
+            SNAP_AGGREGATE_CSV = OUTPUT_DIR / "snap_aggregate_results.csv"
 
     random.seed(SEED)
     np.random.seed(SEED)
@@ -1332,6 +1543,12 @@ def main(argv: list[str] | None = None) -> None:
 
     device = torch.device(DEVICE)
     specs = build_train_specs()
+    if args.only_arch:
+        specs = [s for s in specs if s.architecture in args.only_arch]
+        print(f"--only-arch filter: {[s.name for s in specs]}")
+    if args.only_training_way:
+        specs = [s for s in specs if s.training_way in args.only_training_way]
+        print(f"--only-training-way filter: {[s.name for s in specs]}")
 
     print(f"device={device} hidden={HIDDEN} layers={INTERNAL_STEPS}")
     print(f"train_n={TRAIN_N} test_n={TEST_N} epochs={EPOCHS}")
@@ -1343,7 +1560,9 @@ def main(argv: list[str] | None = None) -> None:
 
     trained: list[tuple[TrainSpec, ResidualGNN]] = []
     for spec in specs:
-        if SKIP_TRAINING:
+        ckpt_path = MODEL_DIR / f"{spec.name}.pt"
+        if SKIP_TRAINING or ckpt_path.exists():
+            print(f"Loading checkpoint: {ckpt_path}")
             model = load_model_checkpoint(spec, device)
         else:
             model = train_model(spec, device)
@@ -1368,7 +1587,7 @@ def main(argv: list[str] | None = None) -> None:
         write_csv(PER_INSTANCE_CSV, all_rows)
         write_csv(AGGREGATE_CSV, aggregate_rows(all_rows))
 
-    for metric in ["approx", "overlap", "planted_exact", "clique_at_least_k", "found_size", "is_clique", "seconds"]:
+    for metric in ["approx", "overlap", "planted_exact", "clique_at_least_k", "found_size", "is_clique", "seconds", "stopping_steps"]:
         print_compact_results(all_results, metric=metric)
 
     if RUN_DEGREE_CORR_CHECK and all_degree_corr_rows:

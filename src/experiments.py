@@ -56,6 +56,14 @@ SNAP_DATASETS = (
 
 SNAP_SPECS = (
     TrainSpec(
+        name="SGNN__objective_train",
+        architecture="SGNN",
+        updater_type="none",
+        use_gradient_in_updater=False,
+        neighbor_gate_updater=False,
+        training_way="objective",
+    ),
+    TrainSpec(
         name="SGNN_U__self_predictor_lpr_train",
         architecture="SGNN+U",
         updater_type="U",
@@ -67,6 +75,14 @@ SNAP_SPECS = (
         name="SGNN_GU__self_predictor_lpr_train",
         architecture="SGNN+GU",
         updater_type="GU",
+        use_gradient_in_updater=True,
+        neighbor_gate_updater=True,
+        training_way="self_predictor_lpr",
+    ),
+    TrainSpec(
+        name="SGNN_DGU__self_predictor_lpr_train",
+        architecture="SGNN+DGU",
+        updater_type="DGU",
         use_gradient_in_updater=True,
         neighbor_gate_updater=True,
         training_way="self_predictor_lpr",
@@ -125,6 +141,17 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _ldr_row_metadata() -> dict:
+    return {
+        "model": "LDR",
+        "architecture": "LDR",
+        "updater_type": "none",
+        "use_gradient_in_updater": False,
+        "neighbor_gate_updater": False,
+        "training_way": "none",
+    }
 
 
 @torch.no_grad()
@@ -189,6 +216,58 @@ def _evaluate_snap(
     return rows
 
 
+@torch.no_grad()
+def _evaluate_snap_ldr(
+    device: torch.device,
+    *,
+    datasets: tuple[str, ...],
+) -> list[dict]:
+    rows: list[dict] = []
+    for dataset_name in datasets:
+        dataset_path = Path("datasets") / f"{dataset_name}.jsonl"
+        if not dataset_path.exists():
+            print(f"SKIP {dataset_name} (LDR): missing {dataset_path}", flush=True)
+            continue
+
+        cache = _load_snap_gt_cache(dataset_name)
+        with dataset_path.open() as f:
+            lines = f.readlines()
+
+        print(f"\n=== LDR on {dataset_name} ({len(lines)} graphs) ===", flush=True)
+
+        for graph_idx, line in enumerate(tqdm(lines, desc=f"ldr:{dataset_name}", unit="graph")):
+            rec = cache[graph_idx]
+            row = json.loads(line)
+            adj = np.array(row["adjacency_matrix"], dtype=np.float32)
+            n = adj.shape[0]
+
+            A = torch.tensor(adj, dtype=torch.float32, device=device)
+            planted = _planted_from_snap_cache(rec, device)
+            max_k = int(rec["max_clique_size"])
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            metrics = train.eval_one_decoder(None, A, planted, "ldr")
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            metrics["seconds"] = time.perf_counter() - t0
+
+            rows.append({
+                **_ldr_row_metadata(),
+                "eval_split": "snap",
+                "regime": dataset_name,
+                "decoder": "ldr",
+                "graph_idx": graph_idx,
+                "n": n,
+                "gt_source": rec.get("source", "cache"),
+                "k_for_generation_and_eval_only": max_k,
+                **metrics,
+            })
+
+    return rows
+
+
 def _print_snap_summary(rows: list[dict]) -> None:
     agg = train.aggregate_rows(rows)
     print("\n=== SNAP approx (Table 6 style) ===", flush=True)
@@ -201,43 +280,71 @@ def _print_snap_summary(rows: list[dict]) -> None:
 
 
 def cmd_snap(args: argparse.Namespace) -> None:
-    train.apply_run_config(train_regime=args.train_regime)
+    train.apply_run_config(
+        train_regime=args.train_regime,
+        layers=getattr(args, "layers", None),
+        epochs=getattr(args, "epochs", None),
+    )
     train.SNAP_GT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     np.random.seed(train.SEED)
     torch.manual_seed(train.SEED)
     device = torch.device(train.DEVICE)
-    decoders = tuple(args.decoders)
+
+    # Separate LDR (no checkpoint) from model-based decoders
+    requested = tuple(args.decoders)
+    model_decoders = tuple(d for d in requested if d != "ldr")
+    run_ldr = "ldr" in requested
 
     use_both = "both" in args.models
     specs: list[TrainSpec] = []
-    if use_both or "u" in args.models:
+    if use_both or "sgnn" in args.models:
         specs.append(SNAP_SPECS[0])
-    if use_both or "gu" in args.models:
+    if use_both or "u" in args.models:
         specs.append(SNAP_SPECS[1])
+    if use_both or "gu" in args.models:
+        specs.append(SNAP_SPECS[2])
+    if use_both or "dgu" in args.models:
+        specs.append(SNAP_SPECS[3])
 
     print(
-        f"snap: device={device} regime={args.train_regime} decoders={decoders} "
-        f"out={train.OUTPUT_DIR}",
+        f"snap: device={device} regime={args.train_regime} "
+        f"decoders={requested} out={train.OUTPUT_DIR}",
         flush=True,
     )
 
     t0 = time.perf_counter()
     all_rows: list[dict] = []
-    for spec in specs:
-        model = train.load_model_checkpoint(spec, device)
-        all_rows.extend(
-            _evaluate_snap(
-                model, spec, device,
-                datasets=tuple(args.datasets), decoders=decoders,
-            )
-        )
 
-    _write_csv(train.SNAP_PER_INSTANCE_CSV, all_rows)
-    _write_csv(train.SNAP_AGGREGATE_CSV, train.aggregate_rows(all_rows))
-    _print_snap_summary(all_rows)
+    # LDR needs no model
+    if run_ldr:
+        all_rows.extend(_evaluate_snap_ldr(device, datasets=tuple(args.datasets)))
+
+    # Model-based decoders — evaluate one dataset at a time, print+save after each
+    if model_decoders:
+        for spec in specs:
+            model = train.load_model_checkpoint(spec, device)
+            for dataset_name in args.datasets:
+                new_rows = _evaluate_snap(
+                    model, spec, device,
+                    datasets=(dataset_name,), decoders=model_decoders,
+                )
+                all_rows.extend(new_rows)
+                # Print aggregate for this dataset immediately
+                agg = train.aggregate_rows(new_rows)
+                for row in agg:
+                    print(
+                        f"[snap done: {dataset_name}] {row['model']:<40} {row['regime']:<14} "
+                        f"{row['decoder']:<14} approx={row['approx_mean']:.3f}±{row['approx_std']:.3f}"
+                        f"  n={row['num_instances']}",
+                        flush=True,
+                    )
+                # Incrementally save everything collected so far
+                _write_csv(train.SNAP_PER_INSTANCE_CSV, all_rows)
+                _write_csv(train.SNAP_AGGREGATE_CSV, train.aggregate_rows(all_rows))
+
     print(f"\nSaved {train.SNAP_PER_INSTANCE_CSV}", flush=True)
-    print(f"Saved {train.SNAP_AGGREGATE_CSV}", flush=True)
+    print(f"\nSaved {train.SNAP_AGGREGATE_CSV}", flush=True)
     print(f"Done in {time.perf_counter() - t0:.1f}s", flush=True)
 
 
@@ -1630,7 +1737,6 @@ def cmd_degree(args: argparse.Namespace) -> None:
 
 
 
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1658,6 +1764,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_regime_arg(snap)
     snap.add_argument(
+        "--layers",
+        type=int,
+        default=None,
+        help="Override GNN layers (e.g. 8 for L8 checkpoints). Default: 4.",
+    )
+    snap.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Override epochs suffix (e.g. 1200 for _E1200 checkpoints). Default: none.",
+    )
+    snap.add_argument(
         "--datasets",
         nargs="+",
         default=list(SNAP_DATASETS),
@@ -1667,14 +1785,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--decoders",
         nargs="+",
         default=("upr",),
-        help="Decoder names (Table 6: upr)",
+        help="Decoder names (ldr needs no checkpoint, others need model)",
     )
     snap.add_argument(
         "--models",
         nargs="+",
-        choices=("u", "gu", "both"),
+        choices=("sgnn", "u", "gu", "dgu", "both"),
         default=("both",),
-        help="SIT checkpoints: SGNN+U, SGNN+GU, or both",
+        help="Checkpoints to evaluate: sgnn, u, gu, dgu, or both (all four)",
     )
     snap.set_defaults(func=cmd_snap)
 

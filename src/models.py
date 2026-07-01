@@ -4,8 +4,9 @@ K-less residual GNN for planted-clique search.
 **SGNN** — one forward pass; fixed removal scores; no UPR.
 **SGNN+U** — scores updated after each removal (MLP on neighbors); UPR; no objective gradient in MLP.
 **SGNN+GU** — same as +U but MLP also sees cached clique-objective gradient.
+**SGNN+DGU** — same 6-input MLP as GU, but gradient divided by Z_t = Σ_{j∈S_t} p_j (dynamic renormalization).
 
-All three: input = alive mask only; no oracle k in forward/loss/updater.
+All: input = alive mask only; no oracle k in forward/loss/updater.
 """
 
 from __future__ import annotations
@@ -81,6 +82,11 @@ class CachedKlessCliqueGradientState:
         return (-2.0 * self.Ap + 2.0 * self.Bp) * self.alive.float()
 
     @torch.no_grad()
+    def gradient_dgu(self) -> torch.Tensor:
+        """Like gradient() but divided by Z_t = sum of alive sigmoid scores (DGU renormalization)."""
+        return self.gradient() / (self.sum_p + 1e-8)
+
+    @torch.no_grad()
     def delete_vertex_only(self, v: torch.Tensor) -> None:
         v_int = int(v.item())
         if not bool(self.alive[v_int].item()):
@@ -97,10 +103,11 @@ class CachedKlessCliqueGradientState:
 
 class ResidualGNN(nn.Module):
     """
-    SGNN / SGNN+U / SGNN+GU (``updater_type``: ``none`` | ``U`` | ``GU``).
+    SGNN / SGNN+U / SGNN+GU / SGNN+DGU.
+    ``updater_type``: ``none`` | ``U`` | ``GU`` | ``DGU``
 
     ``forward(A, alive)`` → removal logits on the residual subgraph.
-    ``update_scores`` — used by LPR/UPR after a vertex is removed (+U / +GU only).
+    ``update_scores`` — used by UPR after a vertex is removed (+U / +GU / +DGU only).
     """
 
     def __init__(
@@ -179,13 +186,14 @@ class ResidualGNN(nn.Module):
         if self.score_updater is None:
             return scores.masked_fill(~alive_after.bool(), -1e9)
 
+        m = alive_after.bool()
         n = A.shape[0]
         v = int(removed.item())
         alive_f = alive_after.float()
         affected = A[:, v]
         if self.use_gradient_in_updater:
             if grad is None:
-                raise RuntimeError("SGNN+GU needs gradient cache")
+                raise RuntimeError("SGNN+GU/DGU needs gradient cache")
             grad_i, grad_v = grad, grad[v].expand(n)
         else:
             grad_i = grad_v = torch.zeros_like(scores)
@@ -202,7 +210,7 @@ class ResidualGNN(nn.Module):
         else:
             delta = delta * alive_f
 
-        return (scores + delta).masked_fill(~alive_after.bool(), -1e9)
+        return (scores + delta).masked_fill(~m, -1e9)
 
 
 @dataclass

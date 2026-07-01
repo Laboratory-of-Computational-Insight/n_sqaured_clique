@@ -326,5 +326,6 @@ Under `runs/sgnn_paper_medium/` (example):
 ## Notes
 
 - Checkpoints in `runs/sgnn_paper_medium/` may be from an **older** protocol (e.g. 300 epochs). For exact Sec. 3.4 numbers, retrain with current defaults (`EPOCHS=64`, `TRAIN_GRAPHS_PER_EPOCH=1000`).
-- Table 6 column **“SGNN Rerun †”** in the paper is from prior work [11], not this repo.
+- Table 6 column **”SGNN Rerun †”** in the paper is from prior work [11], not this repo.
 - `gu_plots` / `experiments degree` use **medium** eval *k* in filenames even if you load easy/hard checkpoints — edit `REGIME`, `K_MIN`, `K_MAX` in `gu_plots.py` or the degree section of `experiments.py`.
+- **Training is lightweight and easy to reproduce** — a full medium-regime run takes a few hours on a single GPU. If you prefer to skip training entirely, pre-trained weights are available on request: open a GitHub issue and we will share them.
