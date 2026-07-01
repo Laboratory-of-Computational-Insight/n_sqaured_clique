@@ -58,8 +58,8 @@ P_ER = 0.5
 #
 # DO NOT change EPOCHS/TRAIN_GRAPHS_PER_EPOCH for paper reproduction.
 # ===========================================================================
-EPOCHS = 300
-TRAIN_GRAPHS_PER_EPOCH = 1
+EPOCHS = 64
+TRAIN_GRAPHS_PER_EPOCH = 1000
 HIDDEN = 64
 INTERNAL_STEPS = 4
 LR = 1e-3
@@ -76,7 +76,7 @@ SELF_LPR_WEIGHT = 1.0
 #
 # DO NOT change for paper reproduction.
 # ===========================================================================
-EVAL_GRAPHS_PER_REGIME = 30
+EVAL_GRAPHS_PER_REGIME = 1000
 PRINT_EVAL_PROGRESS = False
 SKIP_TRAINING = False
 SAVE_OUTPUTS = True
